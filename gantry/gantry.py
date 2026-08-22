@@ -87,17 +87,40 @@ class GantryResult:
     run_seconds: float            # 仿真总时长 (s)
 
     # ------------------------------------------------------------------
-    def stats(self, tail_trim_s: float = 0.0) -> dict:
+    def _active_end_index(self, settle_tail_s: float = 0.3) -> int:
+        """
+        计算"有效统计窗口"的结束索引：
+        从开始到 主轴最后一次移动的时刻 再加 settle_tail_s 收敛尾段。
+        静止等待段不参与统计，避免把零偏差样本混入稀释 均值/P95。
+        """
+        n = len(self.t)
+        if n < 2:
+            return n
+        dm = np.abs(np.diff(self.master_cmd, append=self.master_cmd[-1]))
+        moving_idx = np.nonzero(dm > 1e-7)[0]
+        if len(moving_idx) == 0:
+            return n
+        # 用时间序列估计采样周期，换算尾段长度
+        dt_est = float(np.median(np.diff(self.t))) if n > 1 else 0.001
+        tail = int(settle_tail_s / dt_est) if dt_est > 0 else 0
+        return min(n, int(moving_idx[-1]) + 1 + tail)
+
+    def stats(self, use_active_window: bool = True) -> dict:
         """
         统计同步偏差 |Δ| 的 均值 / P95 / 最大值 (µm)。
-        默认统计全过程；tail_trim_s 可裁掉尾部静止段。
+
+        use_active_window=True 时只统计运动区段（含 0.3s 收敛尾），
+        这是评价同步性能的合理口径；False 则统计全部记录样本。
         """
-        mask = self.t <= (self.run_seconds - tail_trim_s + 1e-9)
-        data = np.abs(self.sync_err[mask]) * 1000.0  # mm → µm
+        end = self._active_end_index() if use_active_window else len(self.t)
+        data = np.abs(self.sync_err[:end]) * 1000.0  # mm → µm
+        if len(data) == 0:
+            data = np.array([0.0])
         return {
             "mean_um": float(np.mean(data)),
             "p95_um": float(np.percentile(data, 95)),
             "max_um": float(np.max(data)),
+            "samples": int(len(data)),
         }
 
     def to_plot_series(self, max_points: int = 600) -> dict:

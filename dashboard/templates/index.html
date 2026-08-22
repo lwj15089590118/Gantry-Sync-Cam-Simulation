@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>龙门双轴同步 与 电子凸轮·飞剪 虚拟轴仿真看板</title>
+<!-- ECharts 通过 CDN 引入；主源失败时自动回退备用源 -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"
+        onerror="this.onerror=null;var s=document.createElement('script');s.src='https://unpkg.com/echarts@5.5.0/dist/echarts.min.js';document.head.appendChild(s);"></script>
+<style>
+  /* ---------- 全局样式 ---------- */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+         background: #f4f6fa; color: #26303e; }
+  header { background: #1f2d3d; color: #fff; padding: 14px 24px;
+           display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 20px; font-weight: 600; }
+  .badge-disclaim { background: #b7791f; color: #fff; font-size: 12px;
+                    padding: 3px 10px; border-radius: 10px; }
+  .layout { display: grid; grid-template-columns: 300px 1fr;
+            gap: 14px; padding: 14px; max-width: 1500px; margin: 0 auto; }
+  .card { background: #fff; border-radius: 10px; padding: 14px;
+          box-shadow: 0 1px 4px rgba(30,40,60,.08); }
+  .panel h2 { font-size: 15px; margin-bottom: 10px; color: #1f2d3d;
+              border-left: 4px solid #2563eb; padding-left: 8px; }
+  .panel + .panel { margin-top: 16px; }
+  label { display: block; font-size: 13px; margin: 8px 0 4px; }
+  input[type=range] { width: 100%; }
+  input[type=number], select { width: 100%; padding: 6px; border: 1px solid #cbd5e1;
+          border-radius: 6px; font-size: 13px; }
+  .row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-top: 6px; }
+  button { margin-top: 10px; width: 100%; padding: 9px 0; border: none;
+           border-radius: 7px; background: #2563eb; color: #fff; font-size: 14px;
+           cursor: pointer; transition: background .15s; }
+  button:hover { background: #1d4ed8; }
+  button:disabled { background: #94a3b8; cursor: wait; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .chip { background: #eef2ff; color: #3730a3; border-radius: 6px;
+          font-size: 12px; padding: 4px 8px; }
+  .chip.warn { background: #fef3c7; color: #92400e; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .chart { height: 300px; }
+  .chart-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+  canvas#shearAnim { width: 100%; height: 220px; display: block;
+                     background: linear-gradient(#f8fafc, #eef2f7);
+                     border-radius: 8px; }
+  .anim-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .anim-toolbar button { width: auto; padding: 5px 14px; margin: 0; font-size: 12px; }
+  details.report { margin-top: 14px; }
+  details.report summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+  pre#reportText { margin-top: 8px; background: #0f172a; color: #d7e3ff;
+                   padding: 14px; border-radius: 8px; font-size: 12px;
+                   white-space: pre-wrap; max-height: 480px; overflow: auto; }
+  .msg { color: #dc2626; font-size: 12px; margin-top: 6px; min-height: 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>龙门双轴同步 与 电子凸轮·飞剪 虚拟轴仿真看板</h1>
+  <span class="badge-disclaim">全部数据为仿真验证值 · 非真实驱动器调试</span>
+</header>
+
+<div class="layout">
+  <!-- ===================== 左侧参数面板 ===================== -->
+  <div class="card panel-wrap">
+    <div class="panel">
+      <h2>① 龙门双轴同步实验</h2>
+      <label>两轴增益失配度：<span id="misVal">20</span> %（Kp2 = Kp1×(1−失配)）</label>
+      <input type="range" id="mismatch" min="5" max="50" step="1" value="20">
+      <div class="row">
+        <input type="checkbox" id="compOn" checked> 开启交叉耦合同步补偿
+      </div>
+      <button id="btnGantry">运行龙门定位实验</button>
+      <div class="chips" id="gantryChips"></div>
+      <div class="msg" id="gantryMsg"></div>
+    </div>
+
+    <div class="panel">
+      <h2>② 电子凸轮表</h2>
+      <label>定长（主轴每周期位移）mm</label>
+      <input type="number" id="camLength" value="600" step="50" min="300" max="1500">
+      <label>同步窗口长度 mm</label>
+      <input type="number" id="camWindow" value="120" step="10" min="20" max="400">
+      <button id="btnCam">加载凸轮表曲线</button>
+      <div class="msg" id="camMsg"></div>
+    </div>
+
+    <div class="panel">
+      <h2>③ 飞剪仿真</h2>
+      <label>输送带速度：<span id="beltVal">700</span> mm/s</label>
+      <input type="range" id="beltSpeed" min="300" max="1600" step="50" value="700">
+      <button id="btnShear">运行飞剪仿真</button>
+      <div class="chips" id="shearChips"></div>
+      <div class="msg" id="shearMsg"></div>
+    </div>
+  </div>
+
+  <!-- ===================== 右侧图表区 ===================== -->
+  <div>
+    <div class="charts">
+      <div class="card">
+        <div class="chart-title">龙门双轴 指令/实际位置曲线</div>
+        <div id="chartGantryPos" class="chart"></div>
+      </div>
+      <div class="card">
+        <div class="chart-title">实时同步偏差 Δ = act1 − act2（含报警阈值线）</div>
+        <div id="chartSyncErr" class="chart"></div>
+      </div>
+      <div class="card">
+        <div class="chart-title">电子凸轮表：主轴位移 → 剪切轴位移（256 点线性插值）</div>
+        <div id="chartCam" class="chart"></div>
+      </div>
+      <div class="card">
+        <div class="chart-title">飞剪速度曲线：剪切轴实际速度 vs 输送带速度</div>
+        <div id="chartShearVel" class="chart"></div>
+      </div>
+    </div>
+
+    <!-- ===================== 飞剪 Canvas 动画 ===================== -->
+    <div class="card" style="margin-top:14px;">
+      <div class="chart-title">飞剪示意动画（输送带 + 切刀联动，按仿真数据回放）</div>
+      <div class="anim-toolbar">
+        <button id="btnPlay">播放 / 暂停</button>
+        <span style="font-size:12px;color:#64748b;">绿条=同步区（刀带同速）· 红闪=落刀瞬间</span>
+      </div>
+      <canvas id="shearAnim" width="1200" height="220"></canvas>
+    </div>
+
+    <!-- ===================== 测试报告 ===================== -->
+    <details class="report card">
+      <summary>docs/测试报告.md（点击展开，全部为仿真验证值）</summary>
+      <pre id="reportText">加载中……</pre>
+    </details>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* =========================================================
+ * 全局状态与工具函数
+ * ========================================================= */
+let gantryChart = null, syncChart = null, camChart = null, shearChart = null;
+
+function $(id){ return document.getElementById(id); }
+
+/* 等待 ECharts CDN 加载完成（最多 10 秒），然后初始化 */
+function waitECharts(cb, tries){
+  tries = tries || 0;
+  if (typeof echarts !== "undefined"){ cb(); return; }
+  if (tries > 100){ alert("ECharts CDN 加载失败，请检查网络后刷新页面。"); return; }
+  setTimeout(function(){ waitECharts(cb, tries+1); }, 100);
+}
+
+async function postJSON(url, body){
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body || {})
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+  return data;
+}
+async function getJSON(url){
+  const resp = await fetch(url);
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+  return data;
+}
+
+/* 往面板里塞统计小卡片 */
+function renderChips(el, items){
+  el.innerHTML = "";
+  items.forEach(function(it){
+    const span = document.createElement("span");
+    span.className = "chip" + (it.warn ? " warn" : "");
+    span.textContent = it.text;
+    el.appendChild(span);
+  });
+}
+
+/* =========================================================
+ * 图表初始化
+ * ========================================================= */
+function initCharts(){
+  gantryChart = echarts.init($("chartGantryPos"));
+  syncChart   = echarts.init($("chartSyncErr"));
+  camChart    = echarts.init($("chartCam"));
+  shearChart  = echarts.init($("chartShearVel"));
+
+  gantryChart.setOption({
+    tooltip: {trigger:"axis"},
+    legend: {data:["主轴指令","X1 实际","X2 实际"], textStyle:{fontSize:11}},
+    grid:{left:50,right:16,top:34,bottom:28},
+    xAxis:{type:"category", name:"t/s", boundaryGap:false},
+    yAxis:{type:"value", name:"位置 mm", scale:true},
+    series:[
+      {name:"主轴指令", type:"line", showSymbol:false, lineStyle:{width:2, type:"dashed"}},
+      {name:"X1 实际",  type:"line", showSymbol:false, lineStyle:{width:1.5}},
+      {name:"X2 实际",  type:"line", showSymbol:false, lineStyle:{width:1.5}}
+    ]
+  });
+
+  syncChart.setOption({
+    tooltip:{trigger:"axis"},
+    grid:{left:56,right:16,top:20,bottom:28},
+    xAxis:{type:"category", name:"t/s", boundaryGap:false},
+    yAxis:{type:"value", name:"同步偏差 mm", scale:true},
+    series:[{name:"同步偏差", type:"line", showSymbol:false,
+             areaStyle:{opacity:.25}, lineStyle:{width:1.2}}]
+  });
+}
+
+/* =========================================================
+ * 龙门实验
+ * ========================================================= */
+async function runGantry(){
+  $("gantryMsg").textContent = "";
+  const btn = $("btnGantry"); btn.disabled = true;
+  try{
+    const data = await postJSON("/api/gantry", {
+      mismatch_pct: parseFloat($("mismatch").value),
+      comp: $("compOn").checked
+    });
+    const t = data.t;
+    gantryChart.setOption({
+      xAxis:{data:t},
+      series:[
+        {data:data.master_cmd},
+        {data:data.act1},
+        {data:data.act2}
+      ]
+    });
+    syncChart.setOption({
+      xAxis:{data:t},
+      series:[{data:data.sync_err_mm,
+        markLine:{symbol:"none", silent:true,
+          lineStyle:{color:"#dc2626", type:"dashed"},
+          data:[{yAxis:data.sync_threshold_mm, label:{formatter:"报警阈值 +{c}mm"}},
+                {yAxis:-data.sync_threshold_mm, label:{formatter:"−{c}mm"}}]}
+      }]
+    });
+    const p = data.params_used, st = data.stats;
+    renderChips($("gantryChips"), [
+      {text:"失配 " + p.mismatch_pct + "%（Kp1="+p.kp1+" / Kp2="+p.kp2+"）"},
+      {text:p.comp ? "补偿：开" : "补偿：关", warn:!p.comp},
+      {text:"均值 " + st.mean_um + " µm"},
+      {text:"P95 " + st.p95_um + " µm"},
+      {text:"最大 " + st.max_um + " µm"}
+    ].concat(data.alarm_sync ? [{text:"⚠ 触发同步报警停机", warn:true}] : []));
+  }catch(err){
+    $("gantryMsg").textContent = err.message;
+  }finally{ btn.disabled = false; }
+}
+
+/* =========================================================
+ * 电子凸轮表可视化
+ * ========================================================= */
+async function loadCam(){
+  $("camMsg").textContent = "";
+  try{
+    const data = await getJSON(
+      "/api/cam_table?length_mm=" + encodeURIComponent($("camLength").value) +
+      "&window_mm=" + encodeURIComponent($("camWindow").value));
+    const seg = data.seg, L = data.xs[data.xs.length-1];
+    /* 用分段信息给凸轮表上色：待机/加速/同步/减速/返回 */
+    function area(x0,x1,color,label){
+      return [{xAxis:x0, xAxisValue:x0, itemStyle:{color:color}, label:{formatter:label, fontSize:10}},
+              {xAxis:x1}];
+    }
+    camChart.setOption({
+      tooltip:{trigger:"axis",
+        formatter:function(ps){
+          const p0 = ps[0];
+          return "主轴 " + p0.axisValue + " mm<br>剪切轴目标 " + p0.data + " mm";
+        }},
+      grid:{left:56,right:16,top:36,bottom:28},
+      xAxis:{type:"category", name:"主轴位移 mm", boundaryGap:false},
+      yAxis:{type:"value", name:"剪切轴位移 mm", scale:true},
+      series:[{name:"凸轮表", type:"line", showSymbol:false,
+        lineStyle:{width:2, color:"#2563eb"}, data:data.ys,
+        markArea:{silent:true, label:{position:"insideTop", color:"#334155"},
+          data:[
+            [{name:"待机", xAxis: 0, itemStyle:{color:"rgba(148,163,184,.18)"}},
+             {xAxis: L*seg.theta_standby_end}],
+            [{name:"加速追赶", xAxis: L*seg.theta_standby_end, itemStyle:{color:"rgba(59,130,246,.14)"}},
+             {xAxis: L*seg.theta_sync_start}],
+            [{name:"同步·切刀", xAxis: L*seg.theta_sync_start, itemStyle:{color:"rgba(22,163,74,.18)"}},
+             {xAxis: L*seg.theta_sync_end}],
+            [{name:"减速", xAxis: L*seg.theta_sync_end, itemStyle:{color:"rgba(234,88,12,.12)"}},
+             {xAxis: L*seg.theta_return_start}],
+            [{name:"快速返回", xAxis: L*seg.theta_return_start, itemStyle:{color:"rgba(147,51,234,.12)"}},
+             {xAxis: L}]
+          ]}
+      }]
+    });
+    $("camMsg").style.color = "#16a34a";
+    $("camMsg").textContent = "已加载：" + data.name +
+      "（同步段斜率≈1，即刀带同速；落刀相位 " + seg.theta_cut + "）";
+  }catch(err){
+    $("camMsg").style.color = "#dc2626";
+    $("camMsg").textContent = err.message;
+  }
+}
+
+/* =========================================================
+ * 飞剪仿真 + 图表 + Canvas 动画数据准备
+ * ========================================================= */
+let shearData = null;   // 最近一次飞剪结果（供动画回放）
+
+async function runShear(){
+  $("shearMsg").textContent = "";
+  const btn = $("btnShear"); btn.disabled = true;
+  try{
+    const data = await postJSON("/api/shear", {
+      belt_speed: parseFloat($("beltSpeed").value),
+      length_mm:  parseFloat($("camLength").value)
+    });
+    shearData = data;
+    shearChart.setOption({
+      tooltip:{trigger:"axis"},
+      legend:{data:["剪切轴实际速度","输送带速度"], textStyle:{fontSize:11}},
+      grid:{left:60,right:16,top:34,bottom:28},
+      xAxis:{type:"category", name:"t/s", boundaryGap:false},
+      yAxis:{type:"value", name:"速度 mm/s", scale:true},
+      series:[
+        {name:"剪切轴实际速度", type:"line", showSymbol:false,
+         data:data.blade_vel, lineStyle:{width:1.6, color:"#16a34a"}},
+        {name:"输送带速度", type:"line", showSymbol:false,
+         data:data.t.map(function(){ return data.params.belt_speed_mm_s; }),
+         lineStyle:{width:1.4, type:"dashed", color:"#dc2626"}}
+      ]
+    });
+    const m = data.metrics;
+    renderChips($("shearChips"), [
+      {text:"切割 " + m.cuts + " 刀"},
+      {text:"速度误差均值 " + m.sync_err_mean_mm_s + " mm/s"},
+      {text:"误差最大 " + m.sync_err_max_mm_s + " mm/s"},
+      {text:"节拍 " + m.cycle_mean_ms + " ms（理论 " + m.cycle_theory_ms + "）"}
+    ]);
+    animRestart();
+  }catch(err){
+    $("shearMsg").textContent = err.message;
+  }finally{ btn.disabled = false; }
+}
+
+/* =========================================================
+ * 飞剪 Canvas 示意动画（回放最近一次仿真）
+ * ========================================================= */
+const animCv = $("shearAnim");
+const animCtx = animCv.getContext("2d");
+let animPlaying = true, animT = 0, animLastTs = null;
+
+function animRestart(){ animT = 0; animPlaying = true; }
+
+$("btnPlay").addEventListener("click", function(){
+  animPlaying = !animPlaying;
+});
+
+function drawAnim(ts){
+  requestAnimationFrame(drawAnim);
+  const ctx = animCtx, W = animCv.width, H = animCv.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (!shearData){ // 尚无数据时画提示
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("请先运行一次飞剪仿真", W/2 - 90, H/2);
+    return;
+  }
+  if (animPlaying && animLastTs !== null){
+    animT += (ts - animLastTs) / 1000;          // 按 1:1 真实时间推进
+  }
+  animLastTs = ts;
+
+  const d = shearData;
+  const n = d.t.length;
+  const T = d.t[n-1];
+  if (animT > T) { animT = 0; }                 // 循环回放
+
+  /* 时间 → 数据索引（记录间隔均匀） */
+  const idx = Math.min(n-1, Math.max(0, Math.round(animT / (d.t[1]-d.t[0]))));
+
+  const L = d.params.product_length_mm;
+  const beltV = d.params.belt_speed_mm_s;
+  const pxPerMm = W / (L * 2.2);               // 视野约 2.2 个定长
+  const beltY = H * 0.72;                       // 输送带 y 坐标
+  const spanPx = W;
+
+  /* --- 同步区指示条 --- */
+  const syncH = 10;
+  ctx.fillStyle = "#d1fae5";
+  ctx.fillRect(0, 0, W, syncH);
+  if (d.in_sync[idx]){
+    ctx.fillStyle = "#16a34a";
+    ctx.fillRect(0, 0, W, syncH);
+    ctx.fillStyle = "#fff"; ctx.font = "bold 9px sans-serif";
+    ctx.fillText("SYNC 同步区（刀带同速）", 6, 8);
+  } else {
+    ctx.fillStyle = "#64748b"; ctx.font = "9px sans-serif";
+    ctx.fillText("非同步区", 6, 8);
+  }
+
+  /* --- 输送带 --- */
+  ctx.fillStyle = "#cbd5e1";
+  ctx.fillRect(0, beltY + 18, W, 10);
+  /* 带面滚动条纹（向右滚动，速度与带速成比例） */
+  const stripeGap = 46;
+  const offset = (animT * beltV * pxPerMm) % stripeGap;
+  ctx.strokeStyle = "#94a3b8"; ctx.lineWidth = 2;
+  for (let x = -stripeGap + offset; x < W; x += stripeGap){
+    ctx.beginPath();
+    ctx.moveTo(x, beltY + 19); ctx.lineTo(x - 12, beltY + 27);
+    ctx.stroke();
+  }
+
+  /* --- 产品（按定长 L 等间距、随带右移） --- */
+  const prodLen = Math.min(L * 0.35, 260) * pxPerMm;
+  const shift = (animT * beltV * pxPerMm) % (L * pxPerMm);
+  for (let j = -1; j < Math.ceil(W / (L*pxPerMm)) + 1; j++){
+    const x = j * L * pxPerMm + shift;
+    ctx.fillStyle = "rgba(37,99,235,.75)";
+    ctx.fillRect(x, beltY - 26, prodLen, 26);
+    ctx.fillStyle = "#dbeafe";
+    ctx.font = "10px sans-serif";
+    ctx.fillText("产品", x + prodLen/2 - 12, beltY - 10);
+  }
+
+  /* --- 切刀：水平位置跟随凸轮输出 blade_cmd --- */
+  const cutStationX = W * 0.42;                 // 切割工位基准点
+  const bladeX = cutStationX + d.blade_act[idx] * pxPerMm;
+  /* 落刀红闪判定：距任一落刀时刻 < 60ms */
+  let cutting = false;
+  for (const ct of d.cut_times){
+    if (Math.abs(animT - ct) < 0.06){ cutting = true; break; }
+  }
+  /* 导轨 */
+  ctx.strokeStyle = "#94a3b8";
+  ctx.beginPath(); ctx.moveTo(bladeX, H*0.08); ctx.lineTo(bladeX, beltY - 30); ctx.stroke();
+  /* 刀体 */
+  ctx.fillStyle = cutting ? "#ef4444" : "#334155";
+  ctx.beginPath();
+  ctx.moveTo(bladeX - 14, beltY - 52);
+  ctx.lineTo(bladeX + 14, beltY - 52);
+  ctx.lineTo(bladeX, beltY - 28);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillRect(bladeX - 4, H*0.08, 8, beltY - 52 - H*0.08);
+  if (cutting){
+    ctx.strokeStyle = "rgba(239,68,68," + (0.9) + ")"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(bladeX, beltY - 26, 26, 0, Math.PI*2); ctx.stroke();
+  }
+
+  /* --- 信息文字 --- */
+  ctx.fillStyle = "#334155"; ctx.font = "12px monospace";
+  ctx.fillText(
+    "t=" + animT.toFixed(3) + "s  带=" + d.master_pos[idx].toFixed(0) + "mm  " +
+    "刀cmd=" + d.blade_cmd[idx].toFixed(1) + "mm  刀v=" + d.blade_vel[idx].toFixed(0) + "mm/s",
+    10, H - 12);
+}
+requestAnimationFrame(drawAnim);
+
+/* =========================================================
+ * 页面事件绑定与启动
+ * ========================================================= */
+$("mismatch").addEventListener("input", function(){
+  $("misVal").textContent = this.value;
+});
+$("beltSpeed").addEventListener("input", function(){
+  $("beltVal").textContent = this.value;
+});
+$("btnGantry").addEventListener("click", runGantry);
+$("btnCam").addEventListener("click", loadCam);
+$("btnShear").addEventListener("click", runShear);
+
+waitECharts(function(){
+  initCharts();
+  runGantry();     // 默认跑一次龙门实验，页面不空
+  loadCam();       // 默认加载凸轮表
+});
+
+/* 加载测试报告文本 */
+getJSON("/api/report")
+  .then(function(d){ $("reportText").textContent = d.report; })
+  .catch(function(e){ $("reportText").textContent = "报告加载失败：" + e.message; });
+</script>
+</body>
+</html>

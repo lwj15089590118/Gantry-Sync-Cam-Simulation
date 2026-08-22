@@ -1,0 +1,5 @@
+# 龙门双轴同步与电子凸轮·飞剪 虚拟轴仿真 —— 依赖清单
+# Python 3.12 / Windows 10，全部为免费开源库
+# 安装命令：pip install -r requirements.txt
+numpy>=1.26
+flask>=3.0
