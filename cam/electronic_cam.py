@@ -260,25 +260,52 @@ class ShearResult:
     in_sync: np.ndarray            # 是否处于同步窗口（布尔）
     cut_times: list                # 每次落刀时刻 (s)
     table_names: list              # 记录过程中用到的凸轮表名（含切换过程）
+    switch_time: float | None = None  # 换表时刻 (s)；未换表为 None
     metrics: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     def finalize_metrics(self) -> dict:
-        """计算同步段速度误差与节拍指标"""
+        """
+        计算同步段速度误差与节拍指标。
+
+        节拍口径：相邻两次落刀的间隔为"一个周期"。若过程中发生过换表，
+        则横跨换表点的那一段属于新旧配方的过渡期（既不是旧定长的节拍，
+        也不是新定长的节拍），单独计数为 transition_cycles，不混入
+        稳态节拍统计——否则会拉偏 min/max，得出错误的节拍结论。
+        """
         p = self.params
         belt = p.belt_speed_mm_s
         err = np.abs(self.blade_vel[self.in_sync] - belt)
-        cycle_theory = p.product_length_mm / belt * 1000.0  # ms
+        cycle_theory = p.product_length_mm / belt * 1000.0  # ms（主表理论节拍）
+
         cuts = np.array(self.cut_times)
+        transition_cycles = 0
         if len(cuts) >= 2:
             cycles = np.diff(cuts) * 1000.0
-            cycle_mean, cycle_min, cycle_max = (
-                float(np.mean(cycles)),
-                float(np.min(cycles)),
-                float(np.max(cycles)),
-            )
+            if self.switch_time is not None:
+                # 落刀区间 [cuts[i], cuts[i+1]) 包含换表时刻 → 判为过渡周期
+                is_transition = (cuts[:-1] <= self.switch_time) & (
+                    self.switch_time < cuts[1:]
+                )
+                transition_cycles = int(np.sum(is_transition))
+                steady = cycles[~is_transition]
+            else:
+                steady = cycles
+            if len(steady) > 0:
+                cycle_mean = float(np.mean(steady))
+                cycle_min = float(np.min(steady))
+                cycle_max = float(np.max(steady))
+            else:  # 极端情况：全部是过渡段
+                cycle_mean = cycle_min = cycle_max = float("nan")
         else:
             cycle_mean = cycle_min = cycle_max = float("nan")
+
+        # 换表后的新配方理论节拍（供对照；未换表则与主表一致）
+        if p.switch_to_length_mm is not None and self.switch_time is not None:
+            cycle_theory_switched = p.switch_to_length_mm / belt * 1000.0
+        else:
+            cycle_theory_switched = cycle_theory
+
         self.metrics = {
             "cuts": len(self.cut_times),
             "belt_speed_mm_s": belt,
@@ -288,6 +315,8 @@ class ShearResult:
             "cycle_mean_ms": cycle_mean,
             "cycle_min_ms": cycle_min,
             "cycle_max_ms": cycle_max,
+            "transition_cycles": transition_cycles,
+            "cycle_theory_switched_ms": cycle_theory_switched,
             "tables_used": "+".join(dict.fromkeys(self.table_names)),
         }
         return self.metrics
@@ -306,6 +335,7 @@ class ShearResult:
             "blade_vel": [round(v, 2) for v in self.blade_vel[idx]],
             "in_sync": [bool(v) for v in self.in_sync[idx]],
             "cut_times": [round(v, 4) for v in self.cut_times],
+            "switch_time": None if self.switch_time is None else round(self.switch_time, 4),
             "params": {
                 "belt_speed_mm_s": self.params.belt_speed_mm_s,
                 "product_length_mm": self.params.product_length_mm,
@@ -409,18 +439,24 @@ class FlyingShear:
         cut_times: list[float] = []
         prev_phase = 0.0
         switched = False
+        switch_time: float | None = None
+        cam_offset = 0.0  # 换表定相偏移：换表点被记为新表的相位零点（见下方说明）
 
         for k in range(total_steps):
             master.step()
 
-            # 凸轮插值 → 从轴指令流 → 闭环
-            target = cam.evaluate(master.cmd_pos)
+            # 凸轮插值 → 从轴指令流 → 闭环。
+            # 用 m_eff = 主轴位置 - 换表偏移 查表：未换表时 offset=0 行为不变；
+            # 换表后新周期从换表点重新开始（相位归零），两张表在换表点都满足
+            # y=0（刀具待机位），因此刀的目标位置连续、无跳变。
+            m_eff = master.cmd_pos - cam_offset
+            target = cam.evaluate(m_eff)
             shear.set_stream_target(target)
             shear.step()
 
             # 相位推进与事件检测（处理跨周期回绕）
             L_active = cam.active.period
-            phase = math.fmod(master.cmd_pos, L_active) / L_active
+            phase = math.fmod(m_eff, L_active) / L_active
             crossed_cut = (
                 prev_phase < theta_cut <= phase
                 if phase >= prev_phase
@@ -431,7 +467,11 @@ class FlyingShear:
             wrapped = phase < prev_phase  # 本周期是否发生回绕（先判回绕再更新缓存）
             prev_phase = phase
 
-            # 换产切表：在周期回绕边界（刀具已回到待机位）执行，避免相位跳变
+            # 换产切表：在周期回绕边界（刀具已回到待机位）执行。
+            # 关键：同时把换表点记为新表的相位零点（重新定相/re-indexing）——
+            # 若不这样做，新表周期更长会使相位突然"前跳"，被误判为跨过落刀
+            # 相位而虚记一刀（评审发现的真实缺陷）。重新定相后相位平滑延续，
+            # 刀目标位置连续，落刀序列严格按新定长推进。
             if (
                 p.switch_to_length_mm is not None
                 and not switched
@@ -439,6 +479,8 @@ class FlyingShear:
                 and wrapped
             ):
                 cam.switch_table(f"SHEAR_L{p.switch_to_length_mm:.0f}")
+                cam_offset = master.cmd_pos  # 新表从当前主轴位置重新计周期
+                switch_time = k * dt
                 switched = True
 
             # 同步内窗标记（速度误差统计口径）
@@ -471,6 +513,7 @@ class FlyingShear:
             in_sync=np.array(syn_l, dtype=bool),
             cut_times=cut_times,
             table_names=table_l,
+            switch_time=switch_time,
         )
         result.finalize_metrics()
         return result
@@ -509,9 +552,25 @@ if __name__ == "__main__":
           f"最大={m['sync_err_max_mm_s']:.2f}mm/s")
 
     # 3) 定长切换演示：第 1 刀后从 600mm 换到 900mm
+    #    回归点：换表采用"重新定相"，不得虚记落刀；跨越换表的过渡周期要
+    #    单独标记，稳态节拍必须严格等于新定长/带速。
     fs2 = FlyingShear(ShearParams(belt_speed_mm_s=700.0, sim_cycles=4,
                                   switch_to_length_mm=900.0))
     res2 = fs2.run()
-    print(f"\n[换产演示] 用表 {res2.metrics['tables_used']}，"
+    m2 = res2.metrics
+    cuts2 = np.array(res2.cut_times)
+    gaps = np.diff(cuts2) * 1000.0
+    theory2 = m2["cycle_theory_switched_ms"]          # = 900/700*1000 ≈ 1285.7ms
+    steady_gaps = gaps[1:]                            # 首段横跨换表，属过渡周期
+    print(f"\n[换产演示] 用表 {m2['tables_used']}，"
           f"切割时刻 {[round(t, 3) for t in res2.cut_times]}s")
+    print(f"[换产回归] 过渡周期 {m2['transition_cycles']} 个已单独标记；"
+          f"各刀间隔 {np.round(gaps, 1)}ms；换产后稳态节拍 "
+          f"{np.round(steady_gaps, 1)}ms vs 理论 {theory2:.1f}ms")
+    assert m2["transition_cycles"] == 1, "应恰好有 1 个横跨换表的过渡周期"
+    assert len(steady_gaps) > 0 and np.all(
+        np.abs(steady_gaps - theory2) < 2.0
+    ), f"换产后节拍偏离理论值：{steady_gaps}"
+    assert abs(m2["cycle_mean_ms"] - theory2) < 2.0, \
+        "稳态节拍统计不应被过渡周期污染"
     print("自测试完成 [OK]")
