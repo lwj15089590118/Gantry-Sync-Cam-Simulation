@@ -264,11 +264,7 @@ async function loadCam(){
       "/api/cam_table?length_mm=" + encodeURIComponent($("camLength").value) +
       "&window_mm=" + encodeURIComponent($("camWindow").value));
     const seg = data.seg, L = data.xs[data.xs.length-1];
-    /* 用分段信息给凸轮表上色：待机/加速/同步/减速/返回 */
-    function area(x0,x1,color,label){
-      return [{xAxis:x0, xAxisValue:x0, itemStyle:{color:color}, label:{formatter:label, fontSize:10}},
-              {xAxis:x1}];
-    }
+    /* 用分段信息给凸轮表 markArea 上色：待机/加速/同步/减速/返回 */
     camChart.setOption({
       tooltip:{trigger:"axis",
         formatter:function(ps){

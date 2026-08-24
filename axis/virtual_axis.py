@@ -16,18 +16,13 @@
         e_ss = (v + d_load) / Kp      （单位/秒 ÷ 1/秒 = 单位）
 两轴的 Kp 与负载可分别配置 —— 这正是龙门双轴同步偏差实验的物理根源。
 
-本文件只依赖 numpy，可直接运行自测试：python axis/virtual_axis.py
+本文件只依赖标准库，可直接运行自测试：python axis/virtual_axis.py
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
-
-try:
-    import numpy as np  # 仅用于类型上的数值计算便利，核心逻辑保持纯 Python 可读性
-except ImportError:  # pragma: no cover - 环境异常兜底
-    np = None
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +102,7 @@ class VirtualAxis:
         self._target: float = 0.0          # 点到点目标位置 (mm)
         self._profile_vel: float = 0.0     # 本次任务的规划速度上限 (mm/s)
         self._jog_vel: float = 0.0         # 点动速度 (mm/s，带方向)
+        self._following_stream: bool = False  # 是否处于外部目标流跟随态（龙门/凸轮从轴）
 
         # ---- 使能 / 报警 ----
         self._enabled: bool = False
@@ -259,14 +255,17 @@ class VirtualAxis:
             )
         return pos
 
+    def _resolve_profile_vel(self, vel: float | None) -> float:
+        """解析规划速度上限：None 用默认最大值，并钳制到轴速度上限内"""
+        v = abs(vel) if vel else self.cfg.max_vel
+        return min(v, self.cfg.max_vel)
+
     def move_abs(self, pos: float, vel: float | None = None) -> "VirtualAxis":
         """绝对运动：走到绝对坐标 pos (mm)"""
         self._check_ready()
         self._mode = MotionMode.ABSOLUTE
         self._target = self._validate_target(pos)
-        self._profile_vel = min(
-            abs(vel) if vel else self.cfg.max_vel, self.cfg.max_vel
-        )
+        self._profile_vel = self._resolve_profile_vel(vel)
         return self
 
     def move_rel(self, delta: float, vel: float | None = None) -> "VirtualAxis":
@@ -274,21 +273,8 @@ class VirtualAxis:
         self._check_ready()
         self._mode = MotionMode.RELATIVE
         self._target = self._validate_target(self._cmd_pos + delta)
-        self._profile_vel = min(
-            abs(vel) if vel else self.cfg.max_vel, self.cfg.max_vel
-        )
+        self._profile_vel = self._resolve_profile_vel(vel)
         return self
-
-    def follow_target(self, target: float, vel: float | None = None) -> None:
-        """
-        连续跟随外部目标流（电子齿轮/凸轮/龙门主从同步用）。
-        与 move_abs 的区别：不改变任务模式，仅把"规划终点"刷新为外部主站给定的
-        目标值，规划器每周期朝该目标做带限幅的插补 —— 这正是主从同步的指令来源。
-        """
-        self._profile_vel = min(abs(vel) if vel else self.cfg.max_vel, self.cfg.max_vel)
-        self._target = target
-        self._mode = MotionMode.JOG if self._mode is None else self._mode  # 保持持续跟踪态
-        # 说明：这里借用 JOG 的"持续运动"语义，但速度由位置闭环插补决定
 
     def jog(self, vel: float) -> "VirtualAxis":
         """点动：以速度 vel (mm/s，带符号) 持续运动，调用 stop() 后减速停止"""
@@ -370,7 +356,7 @@ class VirtualAxis:
         cfg = self.cfg
 
         if self._mode == MotionMode.JOG:
-            if getattr(self, "_following_stream", False):
+            if self._following_stream:
                 # 外部目标流跟随（电子齿轮/凸轮/龙门从轴）：指令直通，见函数内说明。
                 self._follow_stream(T)
                 return  # 位置已在直通中刷新，不再走通用积分
@@ -500,6 +486,15 @@ class VirtualAxis:
             if realtime:
                 time.sleep(self.dt)
         return False
+
+
+# ---------------------------------------------------------------------------
+# 通用工具：图表数据等距降采样（gantry / cam 的 to_plot_series 共用）
+# ---------------------------------------------------------------------------
+def downsample_slice(n: int, max_points: int) -> slice:
+    """生成长度为 n 的序列的等距降采样切片，压缩到约 max_points 个点"""
+    step = max(1, n // max_points)
+    return slice(0, n, step)
 
 
 # ---------------------------------------------------------------------------

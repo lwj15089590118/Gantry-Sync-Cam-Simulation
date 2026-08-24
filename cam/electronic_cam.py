@@ -40,13 +40,13 @@ from dataclasses import dataclass, field
 import numpy as np
 
 try:
-    from axis.virtual_axis import VirtualAxis, AxisConfig
+    from axis.virtual_axis import VirtualAxis, AxisConfig, downsample_slice
 except ImportError:  # pragma: no cover - 直接脚本运行时的路径兜底
     import sys
     import os
 
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from axis.virtual_axis import VirtualAxis, AxisConfig
+    from axis.virtual_axis import VirtualAxis, AxisConfig, downsample_slice
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +324,7 @@ class ShearResult:
     # ------------------------------------------------------------------
     def to_plot_series(self, max_points: int = 1500) -> dict:
         """降采样为适合 Web 图表绘制的数据系列"""
-        n = len(self.t)
-        step = max(1, n // max_points)
-        idx = slice(0, n, step)
+        idx = downsample_slice(len(self.t), max_points)
         return {
             "t": [round(v, 4) for v in self.t[idx]],
             "master_pos": [round(v, 2) for v in self.master_pos[idx]],
@@ -356,10 +354,9 @@ class FlyingShear:
       "待机 → 加速追赶 → 同步(落刀) → 快速返回"
     """
 
-    def __init__(self, params: ShearParams | None = None, dt: float | None = None):
+    def __init__(self, params: ShearParams | None = None):
+        """控制周期等全部参数统一收敛到 ShearParams，避免 dt 双通道配置"""
         self.p = params if params is not None else ShearParams()
-        if dt is not None:
-            self.p.dt = dt
 
     # ------------------------------------------------------------------
     def _make_master(self) -> VirtualAxis:

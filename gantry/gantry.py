@@ -34,20 +34,19 @@
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 # 允许作为包或直接脚本两种方式运行
 try:
-    from axis.virtual_axis import VirtualAxis, AxisConfig, AlarmCode
+    from axis.virtual_axis import VirtualAxis, AxisConfig, AlarmCode, downsample_slice
 except ImportError:  # pragma: no cover - 直接脚本运行时的路径兜底
     import sys
     import os
 
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from axis.virtual_axis import VirtualAxis, AxisConfig, AlarmCode
+    from axis.virtual_axis import VirtualAxis, AxisConfig, AlarmCode, downsample_slice
 
 
 @dataclass
@@ -125,9 +124,7 @@ class GantryResult:
 
     def to_plot_series(self, max_points: int = 600) -> dict:
         """降采样为适合 Web 图表绘制的数据系列"""
-        n = len(self.t)
-        step = max(1, n // max_points)
-        idx = slice(0, n, step)
+        idx = downsample_slice(len(self.t), max_points)
         return {
             "t": [round(v, 4) for v in self.t[idx]],
             "master_cmd": [round(v, 4) for v in self.master_cmd[idx]],
