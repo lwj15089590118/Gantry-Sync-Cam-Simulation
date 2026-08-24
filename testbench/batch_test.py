@@ -187,11 +187,76 @@ def _fmt(v: float, nd: int = 1) -> str:
     return f"{v:.{nd}f}"
 
 
+# ---------------------------------------------------------------------------
+# 数据一致性自检：报告结论必须能被本次数据支撑（评审整改项）
+# ---------------------------------------------------------------------------
+def run_self_checks(
+    cells: list[MatrixCell],
+    improvements: dict[float, float],
+    alarm_result: tuple[bool, bool],
+    shear_rows: list[ShearRow],
+) -> list[tuple[str, bool, str]]:
+    """
+    对实验结果做实时一致性校验，返回 (名称, 是否通过, 数据说明) 列表。
+    任何一项不通过都意味着"报告结论可能与数据脱节"，主流程会以非零码退出。
+    """
+    checks: list[tuple[str, bool, str]] = []
+
+    # ① 龙门：补偿对 P95 的压缩比应符合理论 (1 − 1/(1+2·Kcc))
+    off = {c.mismatch: c.p95_um for c in cells if not c.comp}
+    on = {c.mismatch: c.p95_um for c in cells if c.comp}
+    if off and on:
+        avg_off = float(np.mean(list(off.values())))
+        avg_on = float(np.mean(list(on.values())))
+        measured = (avg_off - avg_on) / avg_off * 100.0
+        kcc = GantryParams().kcc
+        theory = (1.0 - 1.0 / (1.0 + 2.0 * kcc)) * 100.0
+        ok = abs(measured - theory) <= 5.0   # 容差：加减速段动态分量
+        checks.append((
+            "龙门补偿P95压缩比 vs 理论公式",
+            ok,
+            f"实测 {measured:.1f}% vs 理论 {theory:.1f}%（Kcc={kcc:g}），容差 ±5 个百分点",
+        ))
+
+    # ② 龙门：无补偿 P95 应随失配度单调递增（模型合理性）
+    seq = [off[m] for m in sorted(off)]
+    ok_mono = len(seq) >= 2 and all(b >= a for a, b in zip(seq, seq[1:]))
+    checks.append((
+        "无补偿P95随失配度单调递增",
+        ok_mono,
+        f"P95 序列 = {[round(v) for v in seq]} µm",
+    ))
+
+    # ③ 报警演示的方向性：无补偿应停机、有补偿应通过
+    a_off, a_on = alarm_result
+    checks.append((
+        "报警联锁演示方向性",
+        (a_off is True) and (a_on is False),
+        f"无补偿触发={a_off}，有补偿触发={a_on}（失配30%/阈值2mm 工况）",
+    ))
+
+    # ④ 飞剪：稳态节拍与理论 L/v 的最大偏差应很小
+    devs = [
+        abs(r.cycle_mean_ms - r.cycle_theory_ms)
+        for r in shear_rows if r.cuts >= 2
+    ]
+    dev_max = max(devs) if devs else float("nan")
+    ok_dev = bool(devs) and dev_max < 5.0
+    checks.append((
+        "飞剪节拍偏差(实测-理论) < 5ms",
+        ok_dev,
+        f"各带速最大偏差 {dev_max:.2f} ms",
+    ))
+
+    return checks
+
+
 def build_report_md(
     cells: list[MatrixCell],
     improvements: dict[float, float],
     alarm_result: tuple[bool, bool],
     shear_rows: list[ShearRow],
+    checks: list[tuple[str, bool, str]] | None = None,
 ) -> str:
     """把全部实验结果拼装成 Markdown 测试报告文本"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -236,11 +301,12 @@ def build_report_md(
         + "、".join(f"{k:.0%}→{v:.1f}%" for k, v in improvements.items())
         + "。\n"
     )
-    theory_note = (
-        "理论上补偿把稳态偏差压缩为 Δ*/(1+2·Kcc)，Kcc=2 即压缩至 20%"
-        "（下降 80%）；实测与理论吻合，差异来自加减速段的动态分量。"
-    )
-    lines.append(f"- 机理解释：{theory_note}\n")
+    kcc = GantryParams().kcc   # 矩阵实验使用默认参数，理论压缩比由此而来
+    theory_drop = (1.0 - 1.0 / (1.0 + 2.0 * kcc)) * 100.0
+    lines.append(f"- 机理解释：理论上补偿把稳态偏差压缩为 Δ*/(1+2·Kcc)。本实验 Kcc={kcc:g}，"
+                 f"对应理论下降 {theory_drop:.1f}%；实测平均下降 {_fmt(avg_impr)}%，"
+                 f"两者相差 {abs(avg_impr - theory_drop):.1f} 个百分点"
+                 "（差异来自加减速段的动态分量）。\n")
     lines.append("- 失配越大，无补偿偏差近似线性增大（Δ ≈ v/Kp·失配度），补偿后基本被钳制在同一量级。\n")
 
     a_off, a_on = alarm_result
@@ -257,27 +323,46 @@ def build_report_md(
     )
 
     lines.append("## 4 电子凸轮·飞剪带速扫描\n")
-    lines.append("| 带速(mm/s) | 切割次数 | 同步段速度误差均值(mm/s) | 误差最大(mm/s) | 节拍均值(ms) | 节拍理论(ms) | 所用凸轮表 |")
-    lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append("| 带速(mm/s) | 切割次数 | 误差均值(mm/s) | 占带速% | 误差最大(mm/s) | 节拍均值(ms) | 节拍理论(ms) | 节拍偏差(ms) | 所用凸轮表 |")
+    lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for r in shear_rows:
+        ratio = r.err_mean / r.belt_speed * 100.0
+        dev = abs(r.cycle_mean_ms - r.cycle_theory_ms)
         lines.append(
-            f"| {r.belt_speed:.0f} | {r.cuts} | {_fmt(r.err_mean, 2)} | {_fmt(r.err_max, 2)} "
-            f"| {_fmt(r.cycle_mean_ms)} | {_fmt(r.cycle_theory_ms)} | {r.tables_used} |"
+            f"| {r.belt_speed:.0f} | {r.cuts} | {_fmt(r.err_mean, 2)} | {_fmt(ratio, 2)} "
+            f"| {_fmt(r.err_max, 2)} | {_fmt(r.cycle_mean_ms)} | {_fmt(r.cycle_theory_ms)} "
+            f"| {_fmt(dev, 2)} | {r.tables_used} |"
         )
     lines.append("")
-    worst_mean = max(r.err_mean for r in shear_rows)
-    worst_ratio = worst_mean / max(r.belt_speed for r in shear_rows) * 100.0
+    # 结论全部由本次数据计算得出，不写死数值（评审整改项）
+    worst = max(shear_rows, key=lambda r: r.err_mean / r.belt_speed)
+    worst_ratio = worst.err_mean / worst.belt_speed * 100.0
+    cycle_devs = [abs(r.cycle_mean_ms - r.cycle_theory_ms) for r in shear_rows]
     lines.append("### 结论\n")
     lines.append(
-        f"- 全部带速下，同步段内剪切轴与输送带的速度误差均值不超过 "
-        f"**{_fmt(worst_mean, 2)}mm/s（约为带速的 {_fmt(worst_ratio, 2)}%，仿真验证值）**，"
-        "满足“切刀期间刀带同速”的工艺要求。"
+        f"- 同步段速度误差均值最大出现在带速 {worst.belt_speed:.0f}mm/s 工况："
+        f"**{_fmt(worst.err_mean, 2)}mm/s，占该带速的 {_fmt(worst_ratio, 2)}%（仿真验证值）**；"
+        f"对应瞬时最大 {_fmt(worst.err_max, 2)}mm/s。"
     )
-    lines.append("- 循环节拍实测值与理论值 L/v 一致，偏差 < 1ms，验证了定长逻辑的正确性。")
-    lines.append("- 速度误差的主要来源：同步窗入口的加速收敛过程与剪切轴闭环滞后（e≈v/Kp）。")
-    lines.append("  工程上可通过提高位置环增益或引入速度前馈进一步压缩。\n")
+    lines.append(
+        f"- 循环节拍实测与理论值 L/v 的最大偏差为 {_fmt(max(cycle_devs), 2)}ms"
+        "（逐带速实时计算），定长逻辑正确。"
+    )
+    lines.append("- 速度误差随带速升高而增大：同步窗在时域上变短，入口收敛段占比上升；"
+                 "主要来源为剪切轴闭环滞后（e≈v/Kp），工程上可通过提高位置环增益或引入速度前馈进一步压缩。\n")
 
-    lines.append("## 5 复现方式\n")
+    # ---- 数据一致性自检（由本次实验数据实时校验，防止结论与数据脱节）----
+    if checks:
+        lines.append("## 5 数据一致性自检\n")
+        lines.append("> 下表由脚本对本次实验数据实时计算生成；任何一项未通过，"
+                     "即表示报告结论失去数据支撑。\n")
+        lines.append("| 校验项 | 结果 | 说明 |")
+        lines.append("| --- | :---: | --- |")
+        for name, ok, detail in checks:
+            lines.append(f"| {name} | {'通过' if ok else '未通过'} | {detail} |")
+        lines.append("")
+
+    lines.append("## 6 复现方式\n")
     lines.append("```bash")
     lines.append("pip install -r requirements.txt")
     lines.append("python -m testbench.batch_test     # 重新生成本报告与 CSV 数据")
@@ -305,6 +390,9 @@ def main() -> None:
     alarm_result = run_alarm_demo()
     shear_rows = run_shear_sweep()
 
+    # ---- 数据一致性自检（评审整改项）：结论必须能被数据支撑 ----
+    checks = run_self_checks(cells, improvements, alarm_result, shear_rows)
+
     # ---- 写 CSV 原始数据 ----
     matrix_csv = DATA_DIR / "gantry_matrix.csv"
     with open(matrix_csv, "w", newline="", encoding="utf-8-sig") as f:
@@ -318,22 +406,35 @@ def main() -> None:
     shear_csv = DATA_DIR / "flying_shear_sweep.csv"
     with open(shear_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["带速_mm_s", "切割次数", "误差均值_mm_s", "误差最大_mm_s",
-                    "节拍均值_ms", "节拍理论_ms"])
+        w.writerow(["带速_mm_s", "切割次数", "误差均值_mm_s", "误差均值占带速_%",
+                    "误差最大_mm_s", "节拍均值_ms", "节拍理论_ms", "节拍偏差_ms"])
         for r in shear_rows:
             w.writerow([f"{r.belt_speed:.0f}", r.cuts, f"{r.err_mean:.3f}",
+                        f"{r.err_mean / r.belt_speed * 100.0:.3f}",
                         f"{r.err_max:.3f}", f"{r.cycle_mean_ms:.2f}",
-                        f"{r.cycle_theory_ms:.2f}"])
+                        f"{r.cycle_theory_ms:.2f}",
+                        f"{abs(r.cycle_mean_ms - r.cycle_theory_ms):.2f}"])
 
     # ---- 写 Markdown 报告 ----
-    report = build_report_md(cells, improvements, alarm_result, shear_rows)
+    report = build_report_md(cells, improvements, alarm_result, shear_rows, checks)
     report_path = DOCS_DIR / "测试报告.md"
     report_path.write_text(report, encoding="utf-8")
+
+    print("\n[数据一致性自检]")
+    failed = 0
+    for name, ok, detail in checks:
+        mark = "[通过]" if ok else "[未通过]"
+        print(f"  {mark} {name}：{detail}")
+        failed += 0 if ok else 1
 
     print("\n" + "=" * 72)
     print(f"完成！报告：{report_path}")
     print(f"数据：{matrix_csv}")
     print(f"数据：{shear_csv}")
+    if failed:
+        print(f"警告：{failed} 项自检未通过，报告已如实标注；"
+              "结论暂不可信，请检查参数或实现后重跑。")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
