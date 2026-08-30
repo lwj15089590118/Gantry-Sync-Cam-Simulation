@@ -34,6 +34,7 @@ class AlarmCode:
     NONE = 0            # 无报警
     SOFT_LIMIT = 1      # 软限位触发
     FOLLOWING_ERROR = 2 # 跟随误差超差
+    SYNC_EXCEED = 3     # 龙门同步偏差超限（由上层控制器经 latch_alarm() 注入锁存）
 
 
 class MotionMode:
@@ -216,6 +217,15 @@ class VirtualAxis:
             print(f"[{self.cfg.name}] 触发报警 code={code}：{reason}，已停机锁存")
         self._abort_task()
 
+    def latch_alarm(self, code: int, reason: str) -> "VirtualAxis":
+        """
+        注入一个外部（控制器级）报警并锁存，如龙门"同步偏差超限"：
+        报警后本轴立即封锁输出（实际位置/速度冻结，见 step()），
+        且在 clear_alarm() 之前禁止使能与任何运动指令。
+        """
+        self._latch_alarm(code, reason)
+        return self
+
     def _abort_task(self) -> None:
         """终止当前运动任务，指令速度清零"""
         self._mode = None
@@ -257,7 +267,7 @@ class VirtualAxis:
 
     def _resolve_profile_vel(self, vel: float | None) -> float:
         """解析规划速度上限：None 用默认最大值，并钳制到轴速度上限内"""
-        v = abs(vel) if vel else self.cfg.max_vel
+        v = abs(vel) if vel is not None else self.cfg.max_vel
         return min(v, self.cfg.max_vel)
 
     def move_abs(self, pos: float, vel: float | None = None) -> "VirtualAxis":
@@ -335,6 +345,15 @@ class VirtualAxis:
                 self._latch_alarm(AlarmCode.FOLLOWING_ERROR, "跟随误差超过设定阈值")
 
         # ---------- 3. 闭环被控对象（一阶模型）----------
+        if not self._enabled or self.has_alarm:
+            # 未使能或报警锁存：驱动器封锁输出（模拟下电/抱闸），被控对象
+            # 不再受力 —— 实际位置/实际速度冻结，绝不会被闭环拉向指令位置。
+            # （否则"去使能立即封锁输出"就名不符实：轴会继续"伺服"到冻结
+            #  的指令位置，软限位报警后还会表现为自动退回限位内。）
+            self._act_vel = 0.0
+            cmd_quantized = round(self._cmd_pos * self.cfg.pulse_per_unit) / self.cfg.pulse_per_unit
+            self._loop_error = cmd_quantized - self._act_pos  # 遥测：冻结后的环内偏差
+            return
         # 脉冲当量量化：真实系统里指令是离散脉冲，这里把指令量化到 1 个脉冲分辨率
         ppu = self.cfg.pulse_per_unit
         cmd_quantized = round(self._cmd_pos * ppu) / ppu

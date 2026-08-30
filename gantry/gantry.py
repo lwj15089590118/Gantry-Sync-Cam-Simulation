@@ -9,7 +9,7 @@
 位置环增益 Kp、负载特性不可能完全一致（编码器/丝杠/摩擦差异），
 恒速运动时各自的跟随误差 e ≈ v/Kp 不同，于是产生"同步偏差"：
 
-        Δ = p_act1 - p_act2 = v/Kp1 - v/Kp2 ≠ 0   （增益失配时）
+        Δ = p_act1 - p_act2 = v/Kp2 - v/Kp1 ≠ 0   （增益失配时）
 
 控制结构
 --------
@@ -82,8 +82,11 @@ class GantryResult:
     act1: np.ndarray              # X1 实际位置 (mm)
     act2: np.ndarray              # X2 实际位置 (mm)
     sync_err: np.ndarray          # 同步偏差 act1-act2 (mm)
-    alarm_sync: bool              # 是否触发同步偏差报警
+    alarm_sync: bool              # 是否触发同步偏差报警（联锁停机）
     run_seconds: float            # 仿真总时长 (s)
+    vel1: np.ndarray | None = None    # X1 实际速度 (mm/s)，与 t 同长
+    vel2: np.ndarray | None = None    # X2 实际速度 (mm/s)，与 t 同长
+    alarm_time_s: float | None = None  # 报警联锁触发时刻 (s)；未报警为 None
 
     # ------------------------------------------------------------------
     def _active_end_index(self, settle_tail_s: float = 0.3) -> int:
@@ -99,9 +102,12 @@ class GantryResult:
         moving_idx = np.nonzero(dm > 1e-7)[0]
         if len(moving_idx) == 0:
             return n
-        # 用时间序列估计采样周期，换算尾段长度
+        # 用时间序列估计采样周期，换算尾段长度。
+        # round 抑制浮点噪声：k*dt 的差值中位数会带最后一位浮点误差，
+        # 直接 int() 截断会让尾段长度在 59/60 之间漂移，统计窗口
+        # （从而 CSV 均值）随记录长度不可复现。
         dt_est = float(np.median(np.diff(self.t))) if n > 1 else 0.001
-        tail = int(settle_tail_s / dt_est) if dt_est > 0 else 0
+        tail = int(round(settle_tail_s / dt_est)) if dt_est > 0 else 0
         return min(n, int(moving_idx[-1]) + 1 + tail)
 
     def stats(self, use_active_window: bool = True) -> dict:
@@ -145,8 +151,17 @@ class GantryController:
       - MASTER：虚拟主轴（只做轨迹发生器，其指令位置作为两从轴的共同目标）
       - X1/X2：两台虚拟伺服从轴，增益/负载按参数配置（天然产生失配）
       - 交叉耦合补偿器：把同步偏差对称反馈到两轴目标上（可开关）
-      - 同步监测器：|Δ| 超阈值 → 双轴报警停机（模拟真实龙门的安全逻辑）
+      - 同步监测器：|Δ| 超阈值 → 联锁停机（模拟真实龙门的安全逻辑）
+
+    同步报警联锁（超差即停，真实执行的动作链）：
+      ① 主轴停令：MASTER 按加速度限幅斜坡停车，目标流归零；
+      ② 双从轴封锁输出：X1/X2 脱离目标流、去使能并锁存 SYNC_EXCEED
+         报警码（实际位置/速度冻结，报警后 20ms 内双轴速度归零）；
+      ③ 控制器进入 FAULTED（见 state 属性）：补偿停用、不再下发目标，
+         须 reset() 复位重建后才能重新定位。
     """
+
+    ALARM_TAIL_S = 0.2  # 报警后再记录的收尾数据时长 (s)，便于图表展示停机时刻
 
     def __init__(self, params: GantryParams | None = None, dt: float = 0.001):
         self.p = params if params is not None else GantryParams()
@@ -206,7 +221,16 @@ class GantryController:
         self.axis1.set_following_stream(True)
         self.axis2.set_following_stream(True)
 
-        self.alarm_sync = False  # 同步报警锁存标志
+        self.alarm_sync = False              # 同步报警锁存标志（控制器级）
+        self.alarm_code = AlarmCode.NONE     # 控制器级报警码（SYNC_EXCEED）
+        self._alarm_time_s: float | None = None  # 报警触发时刻 (s)
+        self._step_count = 0                 # _step_once 累计步数（推算报警时刻用）
+
+    # ------------------------------------------------------------------
+    @property
+    def state(self) -> str:
+        """控制器状态：RUNNING（正常运行）/ FAULTED（同步报警联锁触发后）"""
+        return "FAULTED" if self.alarm_sync else "RUNNING"
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -217,14 +241,22 @@ class GantryController:
     def _step_once(self) -> None:
         """推进一个控制周期：主轴 → 补偿分配 → 从轴闭环 → 同步监测"""
         p = self.p
+        self._step_count += 1
 
         # 1) 主轴轨迹推进
         self.master.step()
 
+        if self.alarm_sync:
+            # FAULTED：联锁已触发，不再产生任何新目标 —— 主轴指令斜坡收尾，
+            # 两从轴输出封锁（实际位置/速度冻结），仅推进模型保持冻结状态
+            self.axis1.step()
+            self.axis2.step()
+            return
+
         # 2) 计算本周期两从轴的目标（是否叠加交叉耦合修正）
         m_cmd = self.master.cmd_pos
         delta = self.axis1.act_pos - self.axis2.act_pos  # 当前同步偏差
-        if p.comp_enabled and not self.alarm_sync:
+        if p.comp_enabled:
             tgt1 = m_cmd - p.kcc * delta   # 领先轴目标回拉
             tgt2 = m_cmd + p.kcc * delta   # 落后轴目标前推
         else:
@@ -238,12 +270,33 @@ class GantryController:
         self.axis2.step()
 
         # 4) 同步偏差监测（真实龙门的安全联锁逻辑）
-        if not self.alarm_sync and abs(delta) > p.sync_threshold_mm:
-            self.alarm_sync = True
-            print(
-                f"[GANTRY] 同步偏差 {delta:.3f}mm 超过阈值 "
-                f"{p.sync_threshold_mm}mm → 双轴报警停机！"
+        if abs(delta) > p.sync_threshold_mm:
+            self._trigger_sync_interlock(delta)
+
+    # ------------------------------------------------------------------
+    def _trigger_sync_interlock(self, delta: float) -> None:
+        """
+        同步偏差超限 → 执行真实的联锁停机动作链（FAULTED）：
+          ① 主轴停令：MASTER 脱离定位任务，指令按加速度限幅斜坡归零；
+          ② 双从轴脱离目标流 + 封锁输出（去使能）+ 锁存 SYNC_EXCEED 报警码；
+          ③ 控制器置 alarm_sync / alarm_code，记录触发时刻；
+             之后 _step_once 不再下发任何目标，须 reset() 复位才能重走。
+        """
+        self.alarm_sync = True
+        self.alarm_code = AlarmCode.SYNC_EXCEED
+        self._alarm_time_s = self._step_count * self.dt
+        print(
+            f"[GANTRY] 同步偏差 {delta:.3f}mm 超过阈值 "
+            f"{self.p.sync_threshold_mm}mm → 触发联锁停机！"
+        )
+        self.master.stop()
+        for ax in (self.axis1, self.axis2):
+            ax.set_following_stream(False)
+            ax.latch_alarm(
+                AlarmCode.SYNC_EXCEED,
+                f"龙门同步偏差 {delta:.3f}mm 超阈值({self.p.sync_threshold_mm}mm)",
             )
+            ax.disable()  # 封锁输出：实际位置/速度立即冻结（见 VirtualAxis.step）
 
     # ------------------------------------------------------------------
     def run_positioning(
@@ -269,8 +322,9 @@ class GantryController:
         self.master.move_abs(p.target_mm, vel=p.vel_mm_s)
 
         t_list, m_list, a1_list, a2_list, d_list = [], [], [], [], []
+        v1_list, v2_list = [], []
         done_t: float | None = None
-        max_steps = int(120 / self.dt)  # 120s 硬超时保护
+        max_steps = int(120 / self.dt)  # 120s 硬超时兜底（正常定位 ~2s 即收敛退出）
         k = 0
 
         while k < max_steps:
@@ -283,27 +337,33 @@ class GantryController:
                 a1_list.append(self.axis1.act_pos)
                 a2_list.append(self.axis2.act_pos)
                 d_list.append(self.axis1.act_pos - self.axis2.act_pos)
+                v1_list.append(self.axis1.act_vel)
+                v2_list.append(self.axis2.act_vel)
 
-            # 到位判断：主轴完成 且 两从轴进入稳态（指令速度为 0）
+            now = k * self.dt
+            if self.alarm_sync:
+                # 报警联锁已触发：双轴已封锁停机，再记录 ALARM_TAIL_S 收尾
+                # 数据用于图表展示停机时刻，随后退出
+                if now - self._alarm_time_s >= self.ALARM_TAIL_S:
+                    break
+                continue
+
+            # 到位判断：主轴与两从轴的指令速度均归零。
+            # 注意不能用 axis.is_moving()：目标流跟随态从轴（set_stream_target）
+            # 的 _mode 恒为 JOG，is_moving 恒为 True，用它判稳会导致循环
+            # 永远跑满 120s 超时（死代码缺陷，详见审查报告 P1-2）。
             moving = (
                 abs(self.master.cmd_vel) > 1e-6
                 or abs(self.axis1.cmd_vel) > 1e-6
-                or self.axis1.is_moving
-                or self.axis2.is_moving
+                or abs(self.axis2.cmd_vel) > 1e-6
             )
-            if not moving and not self.alarm_sync:
+            if not moving:
                 if done_t is None:
-                    done_t = k * self.dt
-                elif k * self.dt - done_t >= settle_extra_s:
+                    done_t = now
+                elif now - done_t >= settle_extra_s:
                     break
             else:
                 done_t = None
-            if self.alarm_sync:
-                # 报警后再记录 200ms 收尾数据，便于图表展示停机时刻
-                if done_t is None:
-                    done_t = k * self.dt
-                elif k * self.dt - done_t >= 0.2:
-                    break
 
         result = GantryResult(
             params=self.p,
@@ -314,12 +374,16 @@ class GantryController:
             sync_err=np.array(d_list),
             alarm_sync=self.alarm_sync,
             run_seconds=k * self.dt,
+            vel1=np.array(v1_list),
+            vel2=np.array(v2_list),
+            alarm_time_s=self._alarm_time_s,
         )
         return result
 
 
 # ---------------------------------------------------------------------------
-# 自测试：直接运行本文件，对比"补偿关 vs 开"在 30% 增益失配下的表现
+# 自测试：直接运行本文件，对比"补偿关 vs 开"在 30% 增益失配下的表现，
+# 并回归验证 到位判定收敛退出 与 同步报警联锁停机 两项关键行为
 # python gantry/gantry.py
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -346,7 +410,46 @@ if __name__ == "__main__":
         print(
             f"补偿={'开' if comp else '关'} | 同步偏差均值={st['mean_um']:8.1f}µm "
             f"P95={st['p95_um']:8.1f}µm 最大={st['max_um']:8.1f}µm "
-            f"| 理论稳态≈{theory:7.1f}µm | 报警={res.alarm_sync}"
+            f"| 理论稳态≈{theory:7.1f}µm | 报警={res.alarm_sync} "
+            f"| 定位收敛耗时={res.run_seconds:.2f}s"
         )
+        # 回归断言（审查报告 P1-2）：到位判定必须真实生效，
+        # 修复前的死代码缺陷会让每次定位固定空跑 120s
+        assert res.run_seconds < 10.0, (
+            f"定位未及时收敛退出：run_seconds={res.run_seconds:.1f}s（疑似 120s 空跑回归）"
+        )
+        assert not res.alarm_sync, "默认阈值 10mm 下 30% 失配不应触发同步报警"
+
+    # ---- 联锁回归（审查报告 P1-1）：阈值 2mm + 无补偿 → 双轴真实停机 ----
+    print("\n[联锁回归] 失配 30%、阈值 2mm、无补偿 → 应触发联锁并双轴停机：")
+    prm = GantryParams(mismatch=0.30, comp_enabled=False, sync_threshold_mm=2.0)
+    ctl = GantryController(prm)
+    res = ctl.run_positioning()
+    assert res.alarm_sync and res.alarm_time_s is not None, "应触发同步报警联锁"
+    assert ctl.state == "FAULTED", "报警后控制器应进入 FAULTED 状态"
+    assert ctl.alarm_code == AlarmCode.SYNC_EXCEED, "控制器应锁存 SYNC_EXCEED 报警码"
+    assert ctl.axis1.alarm == AlarmCode.SYNC_EXCEED and not ctl.axis1.is_enabled, (
+        "X1 应锁存 SYNC_EXCEED 并封锁输出"
+    )
+    assert ctl.axis2.alarm == AlarmCode.SYNC_EXCEED and not ctl.axis2.is_enabled, (
+        "X2 应锁存 SYNC_EXCEED 并封锁输出"
+    )
+    idx = np.nonzero(res.t >= res.alarm_time_s + 0.02)[0]  # 报警 20ms 后
+    assert len(idx) > 1, "报警后应仍有收尾记录样本"
+    assert np.max(np.abs(res.vel1[idx])) == 0.0 and np.max(np.abs(res.vel2[idx])) == 0.0, (
+        "报警 20ms 后双轴速度必须归零并保持（真实停机，而非走完全程）"
+    )
+    drift = np.max(np.abs(np.diff(res.act1[idx]))) + np.max(np.abs(np.diff(res.act2[idx])))
+    assert drift == 0.0, f"报警后双轴位置必须冻结（实测漂移 {drift:.6f}mm）"
+    assert res.run_seconds < 1.0, (
+        f"报警工况应在报警后 0.2s 收尾退出，实测 run_seconds={res.run_seconds:.2f}s"
+    )
+    print(
+        f"  触发时刻 t={res.alarm_time_s:.3f}s，双轴停机于 "
+        f"act1={res.act1[idx[0]]:.1f}mm / act2={res.act2[idx[0]]:.1f}mm（未走完全程 300mm），"
+        f"20ms 后速度=0、位置零漂移，SYNC_EXCEED 已锁存 [OK]"
+    )
 
     print("\n说明：理论稳态 Δ*=v(1/Kp2-1/Kp1)/(1+2Kcc)；补偿开启时应显著下降。")
+    print("说明：同步报警联锁 = 主轴斜坡停 + 双从轴封锁输出并锁存 SYNC_EXCEED，")
+    print("      控制器进入 FAULTED，须 reset() 复位后才能重走（自测试已断言）。")

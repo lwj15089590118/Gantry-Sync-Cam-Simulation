@@ -8,8 +8,9 @@
 1. 龙门矩阵：交叉耦合补偿 开/关 × 两轴增益失配 5% / 10% / 20% / 30%
    → 每格统计同步偏差 均值 / P95 / 最大值 (µm)，并计算补偿带来的
      P95 下降百分比。
-2. 同步报警联锁演示：30% 失配、阈值收紧到 2mm 时，无补偿触发停机、
-   有补偿正常完成 —— 展示真实龙门"超差即停"的安全逻辑。
+2. 同步报警联锁演示：30% 失配、阈值收紧到 2mm 时，无补偿触发报警
+   联锁停机（双轴封锁输出、速度归零、SYNC_EXCEED 锁存）、有补偿
+   正常完成 —— 展示真实龙门"超差即停"的安全逻辑。
 3. 飞剪带速扫描：400 / 700 / 1000 / 1300 mm/s
    → 同步段速度误差 均值/最大、循环节拍（实测 vs 理论）。
 
@@ -38,9 +39,11 @@ import numpy as np
 # 支持包运行与直接脚本运行两种方式
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from axis.virtual_axis import AlarmCode
     from gantry.gantry import GantryController, GantryParams
     from cam.electronic_cam import FlyingShear, ShearParams
 else:
+    from axis.virtual_axis import AlarmCode
     from gantry.gantry import GantryController, GantryParams
     from cam.electronic_cam import FlyingShear, ShearParams
 
@@ -64,6 +67,7 @@ class MatrixCell:
     max_um: float
     samples: int
     alarm_sync: bool
+    run_seconds: float  # 定位收敛退出耗时 (s)，用于回归"无 120s 空跑"
 
 
 def run_gantry_matrix(
@@ -97,11 +101,13 @@ def run_gantry_matrix(
                     max_um=st["max_um"],
                     samples=st["samples"],
                     alarm_sync=res.alarm_sync,
+                    run_seconds=res.run_seconds,
                 )
             )
             done += 1
             print(f"[龙门矩阵 {done}/{total}] 失配={mis:.0%} 补偿={'开' if comp else '关'} "
-                  f"P95={st['p95_um']:.1f}µm max={st['max_um']:.1f}µm")
+                  f"P95={st['p95_um']:.1f}µm max={st['max_um']:.1f}µm "
+                  f"定位耗时={res.run_seconds:.2f}s")
     return cells
 
 
@@ -119,26 +125,87 @@ def _p95_improvements(cells: list[MatrixCell]) -> dict[float, float]:
 # ---------------------------------------------------------------------------
 # 实验 2：同步报警联锁演示
 # ---------------------------------------------------------------------------
-def run_alarm_demo() -> tuple[bool, bool]:
+@dataclass
+class AlarmDemo:
+    """同步报警联锁演示结果"""
+
+    alarm_no_comp: bool   # 无补偿是否触发同步报警
+    alarm_comp: bool      # 有补偿是否触发同步报警
+    interlock_ok: bool    # 联锁停机是否真实发生（速度归零+位置冻结+报警锁存）
+    stop_ms: float        # 报警触发到双轴速度归零的耗时 (ms)
+    detail: str           # 联锁验证说明（供报告/自检输出）
+
+
+def _verify_interlock(ctl: GantryController, res) -> tuple[bool, float, str]:
+    """
+    验证同步报警联锁停机的真实性（审查报告 P1-1）：
+      ① 报警后 20ms 内双轴实际速度归零并保持为零；
+      ② 报警后双轴实际位置冻结（不再走完全程，停机后零漂移）；
+      ③ 轴级 SYNC_EXCEED 报警锁存、输出封锁（去使能），控制器 FAULTED。
+    返回 (是否通过, 停机耗时 ms, 说明文字)
+    """
+    if res.alarm_time_s is None:
+        return False, float("nan"), "未记录到报警触发时刻"
+    idx = np.nonzero(res.t >= res.alarm_time_s)[0]
+    if len(idx) < 2:
+        return False, float("nan"), "报警后记录样本不足"
+    v_peak = np.maximum(np.abs(res.vel1[idx]), np.abs(res.vel2[idx]))
+    moving = v_peak > 1e-6
+    if moving.any():
+        stop_ms = float((res.t[idx[moving][-1]] - res.alarm_time_s) * 1000.0)
+        stop_txt = f"{stop_ms:.1f}ms"
+    else:
+        # 首个报警后样本速度已为 0：在记录分辨率内即完成封锁
+        stop_ms = 0.0
+        dt_rec = float(np.median(np.diff(res.t))) if len(res.t) > 1 else 0.005
+        stop_txt = f"≤{dt_rec*1000:.0f}ms（记录分辨率内）"
+    # 停机后位置漂移（双轴实际位置必须冻结）
+    drift_um = float(
+        np.max(np.abs(np.diff(res.act1[idx]))) + np.max(np.abs(np.diff(res.act2[idx])))
+    ) * 1000.0
+    latched = (
+        ctl.alarm_code == AlarmCode.SYNC_EXCEED
+        and ctl.state == "FAULTED"
+        and ctl.axis1.alarm == AlarmCode.SYNC_EXCEED
+        and ctl.axis2.alarm == AlarmCode.SYNC_EXCEED
+        and not ctl.axis1.is_enabled
+        and not ctl.axis2.is_enabled
+    )
+    ok = stop_ms <= 20.0 and drift_um <= 1.0 and latched
+    detail = (
+        f"停机耗时 {stop_txt}（要求 ≤20ms），停机后位置漂移 {drift_um:.3f}µm，"
+        f"SYNC_EXCEED 锁存={latched}，控制器状态={ctl.state}"
+    )
+    return ok, stop_ms, detail
+
+
+def run_alarm_demo() -> AlarmDemo:
     """
     收紧阈值到 2mm、失配 30%：
-      无补偿 → 应触发同步报警停机；
+      无补偿 → 应触发同步报警并联锁停机；
       有补偿 → 应正常完成定位。
-    返回 (无补偿是否报警, 有补偿是否报警)
+    无补偿分支额外验证联锁动作真实发生（见 _verify_interlock）。
     """
     alarm_off = alarm_on = False
+    demo = AlarmDemo(False, False, False, float("nan"), "未触发报警，无联锁可验证")
     for comp in (False, True):
         prm = GantryParams(
             mismatch=0.30, comp_enabled=comp, sync_threshold_mm=2.0
         )
-        res = GantryController(prm).run_positioning()
+        ctl = GantryController(prm)
+        res = ctl.run_positioning()
         if comp:
             alarm_on = res.alarm_sync
         else:
             alarm_off = res.alarm_sync
+            if res.alarm_sync:
+                ok, stop_ms, detail = _verify_interlock(ctl, res)
+                demo = AlarmDemo(alarm_off, alarm_on, ok, stop_ms, detail)
         print(f"[报警演示] 失配=30% 阈值=2mm 补偿={'开' if comp else '关'} → "
-              f"{'触发停机' if res.alarm_sync else '正常完成'}")
-    return alarm_off, alarm_on
+              f"{'触发联锁停机' if res.alarm_sync else '正常完成'}")
+    if demo.alarm_no_comp:
+        print(f"[联锁验证] {demo.detail} → {'通过' if demo.interlock_ok else '未通过'}")
+    return demo
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +259,7 @@ def _fmt(v: float, nd: int = 1) -> str:
 # ---------------------------------------------------------------------------
 def run_self_checks(
     cells: list[MatrixCell],
-    improvements: dict[float, float],
-    alarm_result: tuple[bool, bool],
+    alarm_demo: AlarmDemo,
     shear_rows: list[ShearRow],
 ) -> list[tuple[str, bool, str]]:
     """
@@ -228,22 +294,41 @@ def run_self_checks(
     ))
 
     # ③ 报警演示的方向性：无补偿应停机、有补偿应通过
-    a_off, a_on = alarm_result
     checks.append((
         "报警联锁演示方向性",
-        (a_off is True) and (a_on is False),
-        f"无补偿触发={a_off}，有补偿触发={a_on}（失配30%/阈值2mm 工况）",
+        (alarm_demo.alarm_no_comp is True) and (alarm_demo.alarm_comp is False),
+        f"无补偿触发={alarm_demo.alarm_no_comp}，有补偿触发={alarm_demo.alarm_comp}"
+        "（失配30%/阈值2mm 工况）",
     ))
 
-    # ④ 飞剪：稳态节拍与理论 L/v 的最大偏差应很小
+    # ③b 联锁停机真实性：报警后 20ms 内双轴速度归零、位置冻结、报警码锁存
+    # （审查报告 P1-1：修复前报警后双轴照走全程，"停机"仅是打印文案）
+    checks.append((
+        "报警联锁停机真实性(≤20ms速度归零+锁存)",
+        alarm_demo.interlock_ok,
+        alarm_demo.detail,
+    ))
+
+    # ③c 龙门定位收敛退出：到位判定必须真实生效（审查报告 P1-2：
+    # 修复前死代码导致每次定位固定空跑 120s）
+    runs = [c.run_seconds for c in cells]
+    ok_conv = bool(runs) and max(runs) < 10.0
+    checks.append((
+        "龙门定位收敛退出(无120s空跑)",
+        ok_conv,
+        f"各工况定位耗时 {min(runs):.2f}~{max(runs):.2f}s",
+    ))
+
+    # ④ 飞剪：稳态节拍与理论 L/v 的最大偏差应很小（README 承诺 <1ms，
+    # 自检阈值与 README 口径一致，审查报告 P3-7）
     devs = [
         abs(r.cycle_mean_ms - r.cycle_theory_ms)
         for r in shear_rows if r.cuts >= 2
     ]
     dev_max = max(devs) if devs else float("nan")
-    ok_dev = bool(devs) and dev_max < 5.0
+    ok_dev = bool(devs) and dev_max < 1.0
     checks.append((
-        "飞剪节拍偏差(实测-理论) < 5ms",
+        "飞剪节拍偏差(实测-理论) < 1ms",
         ok_dev,
         f"各带速最大偏差 {dev_max:.2f} ms",
     ))
@@ -254,7 +339,7 @@ def run_self_checks(
 def build_report_md(
     cells: list[MatrixCell],
     improvements: dict[float, float],
-    alarm_result: tuple[bool, bool],
+    alarm_demo: AlarmDemo,
     shear_rows: list[ShearRow],
     checks: list[tuple[str, bool, str]] | None = None,
 ) -> str:
@@ -309,14 +394,23 @@ def build_report_md(
                  "（差异来自加减速段的动态分量）。\n")
     lines.append("- 失配越大，无补偿偏差近似线性增大（Δ ≈ v/Kp·失配度），补偿后基本被钳制在同一量级。\n")
 
-    a_off, a_on = alarm_result
     lines.append("## 3 同步偏差报警联锁演示\n")
     lines.append("条件：失配 30%，同步偏差阈值收紧至 2mm。\n")
     lines.append("| 工况 | 结果 |")
     lines.append("| --- | --- |")
-    lines.append(f"| 补偿关 | {'⚠ 触发同步报警并双轴停机' if a_off else '正常完成'} |")
-    lines.append(f"| 补偿开 | {'⚠ 触发同步报警并双轴停机' if a_on else '✔ 正常完成'} |")
+    lines.append(f"| 补偿关 | {'⚠ 触发同步报警并联锁停机' if alarm_demo.alarm_no_comp else '正常完成'} |")
+    lines.append(f"| 补偿开 | {'⚠ 触发同步报警并联锁停机' if alarm_demo.alarm_comp else '✔ 正常完成'} |")
     lines.append("")
+    if alarm_demo.alarm_no_comp:
+        lines.append(
+            "联锁动作链（代码真实执行）：报警触发 → 主轴指令斜坡停 → 双从轴"
+            "脱离目标流并封锁输出（去使能、实际位置/速度冻结）→ 轴级锁存 "
+            "`SYNC_EXCEED` 报警码 → 控制器进入 FAULTED，须复位后才能重走。\n"
+        )
+        lines.append(
+            f"停机过程实测（仿真验证值）：{alarm_demo.detail}；"
+            f"双轴分别停于行程中段而非走完全程 300mm。\n"
+        )
     lines.append(
         "> 说明：真实龙门横梁两侧严重失步会造成机械卡死/横梁扭曲，"
         "> 因此控制器必须提供“同步偏差超限即停”的安全联锁；补偿算法则从控制上避免进入该工况。\n"
@@ -387,11 +481,11 @@ def main() -> None:
 
     cells = run_gantry_matrix()
     improvements = _p95_improvements(cells)
-    alarm_result = run_alarm_demo()
+    alarm_demo = run_alarm_demo()
     shear_rows = run_shear_sweep()
 
     # ---- 数据一致性自检（评审整改项）：结论必须能被数据支撑 ----
-    checks = run_self_checks(cells, improvements, alarm_result, shear_rows)
+    checks = run_self_checks(cells, alarm_demo, shear_rows)
 
     # ---- 写 CSV 原始数据 ----
     matrix_csv = DATA_DIR / "gantry_matrix.csv"
@@ -416,7 +510,7 @@ def main() -> None:
                         f"{abs(r.cycle_mean_ms - r.cycle_theory_ms):.2f}"])
 
     # ---- 写 Markdown 报告 ----
-    report = build_report_md(cells, improvements, alarm_result, shear_rows, checks)
+    report = build_report_md(cells, improvements, alarm_demo, shear_rows, checks)
     report_path = DOCS_DIR / "测试报告.md"
     report_path.write_text(report, encoding="utf-8")
 
