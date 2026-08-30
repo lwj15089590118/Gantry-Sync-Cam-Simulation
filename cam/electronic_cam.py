@@ -78,6 +78,9 @@ class CamTable:
         self.xs = np.asarray(master_points, dtype=float)
         self.ys = np.asarray(slave_points, dtype=float)
         self.period = float(self.xs[-1] - self.xs[0])
+        # 工艺分段信息（由 build_flying_shear_table 填充）：含落刀相位
+        # theta_cut、同步窗占比等，供换表后刷新落刀相位与统计内窗使用
+        self.seg_info: dict | None = None
 
     # ------------------------------------------------------------------
     def evaluate(self, master_pos: float) -> float:
@@ -193,7 +196,9 @@ def build_flying_shear_table(
     xs = np.linspace(0.0, L, n_points)
     ys = np.interp(xs, theta * L, y)
     ys[0] = ys[-1] = 0.0
-    return CamTable(name, xs, ys), seg_info
+    table = CamTable(name, xs, ys)
+    table.seg_info = seg_info  # 分段信息随表存储，供换表后刷新落刀相位/统计内窗
+    return table, seg_info
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +217,16 @@ class ElectronicCam:
             self.active_name = table.name
 
     def switch_table(self, name: str) -> None:
-        """切换当前激活表（模拟 HMI 上选择新凸轮表 / 换产）"""
+        """
+        切换当前激活表（模拟 HMI 上选择新凸轮表 / 换产）。
+
+        注意：本方法只完成"换表"本身。运行中安全切换还须满足两个约束
+        （FlyingShear.run 的调用逻辑已处理，单独使用本管理器时须自行保证）：
+          1) 在凸轮周期回绕边界（从轴回到待机位）执行，否则从轴目标跳变；
+          2) 切换后须重新定相（重置相位零点），并按新表的 seg_info 刷新
+             落刀相位 theta_cut 与统计内窗 —— 否则换产后落刀时刻会系统性
+             偏移、速度误差统计口径失真。
+        """
         if name not in self.tables:
             raise KeyError(f"凸轮表 {name} 不存在，已注册：{list(self.tables)}")
         self.active_name = name
@@ -424,9 +438,13 @@ class FlyingShear:
         shear = self._make_shear_axis(seg1["peak_blade_travel_mm"])
         master.jog(p.belt_speed_mm_s)  # 输送带匀速开动
 
-        theta_cut = seg1["theta_cut"]           # 落刀相位
-        win = p.sync_window_mm / p.product_length_mm
-        win_inner = win * 0.4                    # 统计用的内窗半宽（避开加减速边缘）
+        # 落刀相位与统计内窗取自主表分段信息；换表后必须用新表的
+        # seg_info 刷新（见下方换表分支），否则换产后落刀时刻会沿用
+        # 旧表相位而系统性偏移（审查报告 P2-1）
+        theta_cut = seg1["theta_cut"]            # 落刀相位（同步区中点）
+        win_inner = (
+            seg1["sync_window_mm"] / seg1["product_length_mm"] * 0.4
+        )                                        # 统计用的内窗半宽（避开加减速边缘）
 
         total_steps = int((p.sim_cycles + 1.5) * p.product_length_mm / p.belt_speed_mm_s / dt)
         rec_every = max(1, int(0.002 / dt))      # 约 2ms 记录一个点
@@ -479,6 +497,16 @@ class FlyingShear:
                 cam_offset = master.cmd_pos  # 新表从当前主轴位置重新计周期
                 switch_time = k * dt
                 switched = True
+                # 落刀相位与统计内窗必须随新表刷新：新表的同步窗占空比不同
+                # （600→900mm 时 theta_cut 由 0.300 变为 0.2667），沿用旧表
+                # 参数会使换产后每次落刀系统性偏后、in_sync 内窗落到新表
+                # 减速区，速度误差统计口径失真（审查报告 P2-1）。
+                seg_new = cam.active.seg_info
+                if seg_new is not None:
+                    theta_cut = seg_new["theta_cut"]
+                    win_inner = (
+                        seg_new["sync_window_mm"] / seg_new["product_length_mm"] * 0.4
+                    )
 
             # 同步内窗标记（速度误差统计口径）
             dist = abs(phase - theta_cut)
@@ -570,4 +598,20 @@ if __name__ == "__main__":
     ), f"换产后节拍偏离理论值：{steady_gaps}"
     assert abs(m2["cycle_mean_ms"] - theory2) < 2.0, \
         "稳态节拍统计不应被过渡周期污染"
+
+    # 4) 换表后落刀相位回归（审查报告 P2-1）：换产后第一刀必须落在
+    #    新表的落刀相位上。回归点：修复前沿用旧表 theta_cut（0.300），
+    #    600→900mm 档换产后每刀系统性偏后约 43ms。
+    _, seg2 = build_flying_shear_table(
+        900.0, min(120.0, 900.0 * 0.2), 0.08, 0.12, 0.10, 256,
+    )
+    assert res2.switch_time is not None and len(res2.cut_times) >= 2
+    cut_expected = res2.switch_time + seg2["theta_cut"] * 900.0 / 700.0
+    cut_actual = res2.cut_times[1]  # 换产后第一刀
+    print(f"\n[换表相位回归] 新表落刀相位 θ_cut={seg2['theta_cut']:.4f}，"
+          f"换产后首刀实测 t={cut_actual:.4f}s vs 按新表相位推算 {cut_expected:.4f}s")
+    assert abs(cut_actual - cut_expected) < 0.005, (
+        f"换产后落刀相位未随新表刷新：实测 {cut_actual:.4f}s vs "
+        f"新表相位推算 {cut_expected:.4f}s（差 {(cut_actual-cut_expected)*1000:.1f}ms）"
+    )
     print("自测试完成 [OK]")
