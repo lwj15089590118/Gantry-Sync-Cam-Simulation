@@ -128,7 +128,6 @@ def api_shear():
                           sync_window_mm=min(120.0, length * 0.2), sim_cycles=3)
         result = FlyingShear(prm).run()
         payload = result.to_plot_series()
-        payload["seg"] = None
         return jsonify(payload)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"飞剪仿真失败：{exc}"}), 400

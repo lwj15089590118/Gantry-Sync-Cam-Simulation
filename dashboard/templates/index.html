@@ -375,8 +375,9 @@ function drawAnim(ts){
   const T = d.t[n-1];
   if (animT > T) { animT = 0; }                 // 循环回放
 
-  /* 时间 → 数据索引（记录间隔均匀） */
-  const idx = Math.min(n-1, Math.max(0, Math.round(animT / (d.t[1]-d.t[0]))));
+  /* 时间 → 数据索引（记录间隔均匀；防单点数组除零） */
+  const recStep = n > 1 ? (d.t[1]-d.t[0]) : 0.002;
+  const idx = Math.min(n-1, Math.max(0, Math.round(animT / recStep)));
 
   const L = d.params.product_length_mm;
   const beltV = d.params.belt_speed_mm_s;
