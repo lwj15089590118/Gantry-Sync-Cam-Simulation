@@ -65,6 +65,9 @@ class AxisConfig:
     load_disturbance: float = 0.0   # 等效负载扰动 (mm/s)：折算成对速度方程的拖拽项
     vel_feedforward: float = 0.0    # 速度前馈系数 0~1：补偿后 e_ss ≈ (1-Kfv)*(v+d)/Kp
     following_error_alarm: float = 5.0  # 跟随误差报警阈值 (mm)；<=0 表示关闭该保护
+    # 软限位受控回退的恢复速度比例（× max_vel）：可配置，
+    # 但无论配多大都会被 VirtualAxis.RECOVER_VEL_MAX_RATIO（25%）硬钳制（防误配）
+    recover_vel_ratio: float = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +85,18 @@ class VirtualAxis:
         for _ in range(int(3 / dt)):          # 以 1ms 步长推进仿真
             ax.step(dt)
             print(ax.cmd_pos, ax.act_pos, ax.following_error)
+
+    软限位报警（SOFT_LIMIT）的恢复遵循真实工程的"受控回退"惯例：
+    报警态输出封锁冻结，但保留唯一运动通道 jog_recover()——仅允许朝
+    限位内侧低速点动，退回限位内后锁存自动解除（见 jog_recover 说明）。
     """
+
+    # 恢复点动速度硬上限 = max_vel × 25%（AxisConfig.recover_vel_ratio 可配，
+    # 但配置值超过该比例的部分一律无效——低速回退是安全底线，防止误配超速）
+    RECOVER_VEL_MAX_RATIO = 0.25
+    # 解除软限位锁存的内侧滞回带 (mm)：实际位置须退回限位内并越过该
+    # 滞回量才自动解除，避免贴着边界来回抖动反复触发/解除
+    RECOVER_RELEASE_HYST_MM = 0.05
 
     def __init__(self, config: AxisConfig | None = None, dt: float = 0.001):
         self.cfg = config if config is not None else AxisConfig()
@@ -108,6 +122,11 @@ class VirtualAxis:
         # ---- 使能 / 报警 ----
         self._enabled: bool = False
         self._alarm: int = AlarmCode.NONE  # 锁存报警码
+
+        # ---- 软限位受控回退（恢复）状态 ----
+        self._recovering: bool = False  # 是否处于受控回退模式（SOFT_LIMIT 报警态）
+        self._recover_side: int = 0     # 越界侧：+1 已越上限 / -1 已越下限 / 0 无
+        self._recover_cmd_bound: float = 0.0  # 回退期间指令位置的包络钳位点 (mm)
 
         # ---- 统计 ----
         self._steps: int = 0               # 累计仿真步数
@@ -182,6 +201,21 @@ class VirtualAxis:
     def is_moving(self) -> bool:
         return self._mode is not None or abs(self._cmd_vel) > 1e-6
 
+    @property
+    def recover_vel_cap(self) -> float:
+        """
+        软限位受控回退的速度上限 (mm/s) = max_vel × recover_vel_ratio。
+        比例被钳制在 [5%, 25%] 内：上限 25% 为硬编码安全底线（防误配），
+        下限 5% 防止误配成 0 导致恢复通道死锁。
+        """
+        ratio = min(max(self.cfg.recover_vel_ratio, 0.05), self.RECOVER_VEL_MAX_RATIO)
+        return self.cfg.max_vel * ratio
+
+    @property
+    def is_recovering(self) -> bool:
+        """是否处于软限位受控回退模式"""
+        return self._recovering
+
     # ------------------------------------------------------------------
     # 使能 / 报警管理（与真实伺服操作习惯一致）
     # ------------------------------------------------------------------
@@ -193,8 +227,10 @@ class VirtualAxis:
         return self
 
     def disable(self) -> "VirtualAxis":
-        """去使能：立即封锁输出（模拟驱动器下电）"""
+        """去使能：立即封锁输出（模拟驱动器下电），并退出受控回退状态"""
         self._enabled = False
+        self._recovering = False
+        self._recover_side = 0
         self._abort_task()
         return self
 
@@ -202,12 +238,17 @@ class VirtualAxis:
         """
         清除报警。只有当报警条件已经消失（例如已离开软限位区间）才允许清除，
         模拟真实系统的"故障条件不消除不能复位"。
+
+        软限位报警的标准恢复流程是 jog_recover() 受控回退：实际位置退回
+        限位内侧时锁存会自动解除；本方法仅在条件已消失时才会复位成功。
         """
         if self._alarm == AlarmCode.SOFT_LIMIT:
             inside = self.cfg.soft_limit_min <= self._act_pos <= self.cfg.soft_limit_max
             if not inside:
                 return False  # 仍压在限位上，禁止复位
         self._alarm = AlarmCode.NONE
+        self._recovering = False
+        self._recover_side = 0
         return True
 
     def _latch_alarm(self, code: int, reason: str) -> None:
@@ -231,6 +272,27 @@ class VirtualAxis:
         self._mode = None
         self._cmd_vel = 0.0
         self._cmd_acc = 0.0
+
+    def _check_recover_release(self) -> None:
+        """
+        受控回退中的解除条件判定（step() 每周期调用）：
+        实际位置退回限位内侧滞回带后，自动解除软限位锁存并停止回退点动；
+        轴保持使能，闭环会把剩余指令误差收敛掉，随即恢复正常运动。
+        """
+        hyst = self.RECOVER_RELEASE_HYST_MM
+        if self._recover_side > 0:
+            back_inside = self._act_pos <= self.cfg.soft_limit_max - hyst
+        else:
+            back_inside = self._act_pos >= self.cfg.soft_limit_min + hyst
+        if back_inside:
+            print(
+                f"[{self.cfg.name}] 实际位置 {self._act_pos:.4f}mm 已退回软限位"
+                f"内侧（滞回 {hyst}mm），锁存自动解除"
+            )
+            self._alarm = AlarmCode.NONE
+            self._recovering = False
+            self._recover_side = 0
+            self._abort_task()  # 停止回退点动（恢复到位即停，不允许再向外）
 
     # ------------------------------------------------------------------
     # 参数在线修改（用于增益失配 / 负载突变等对比实验）
@@ -294,6 +356,78 @@ class VirtualAxis:
         self._profile_vel = abs(self._jog_vel)
         return self
 
+    def jog_recover(self, vel: float) -> "VirtualAxis":
+        """
+        软限位受控回退点动 —— SOFT_LIMIT 报警态下唯一放行的运动通道。
+
+        报警锁存后输出封锁、实际位置冻结，而锁存瞬间实际位置必然在限位外，
+        若无恢复通道则 clear_alarm() 的复位条件永远无法满足（复位死锁）。
+        工业惯例的恢复方式是"受控回退"，本方法的安全约束：
+
+          - 仅适用于 SOFT_LIMIT 报警且轴处于使能状态；其他报警
+            （SYNC_EXCEED / FOLLOWING_ERROR）不提供此通道，语义不变；
+          - 方向约束：仅允许朝限位"内侧"回退，朝外（继续深入限位）的
+            指令直接拒绝；
+          - 速度约束：实际回退速度被钳制到 recover_vel_cap
+            （= max_vel × 比例，硬上限 25%，见类常量），指令端残余误差
+            造成的闭环瞬态同样被该上限封顶（见 step() 的执行器限幅）；
+          - 包络约束：回退起点把指令位置钳回限位边界，恢复期间指令位置
+            绝不允许越过该点（只能原地或向内，见 _plan_step）；
+          - 解除条件：实际位置退回限位内侧滞回带（RECOVER_RELEASE_HYST_MM）
+            后自动解除锁存并停止回退点动，轴保持使能、恢复正常运动。
+
+        若实际位置已在限位内（如报警后由外部方式回位），直接复位报警。
+        """
+        if self._alarm != AlarmCode.SOFT_LIMIT:
+            raise RuntimeError(
+                f"[{self.cfg.name}] 受控回退仅适用于 SOFT_LIMIT 报警"
+                f"（当前报警码 {self._alarm}），语义不变"
+            )
+        if not self._enabled:
+            raise RuntimeError(
+                f"[{self.cfg.name}] 轴已去使能，受控回退通道不可用；"
+                "请按真实驱动器惯例重建/上电复位（报警未清不能上电）"
+            )
+
+        # 越界侧判定（以实际位置为准——软限位本就以实际位置越界为触发口径）
+        if self._act_pos > self.cfg.soft_limit_max:
+            side = 1    # 已越过上限：只允许向内（负速度）回退
+        elif self._act_pos < self.cfg.soft_limit_min:
+            side = -1   # 已越过下限：只允许向内（正速度）回退
+        else:
+            # 实际位置已在限位内：故障条件已消失，直接复位锁存
+            self.clear_alarm()
+            print(f"[{self.cfg.name}] 实际位置已在软限位内，报警直接复位")
+            return self
+
+        if vel * side >= 0.0:
+            raise ValueError(
+                f"[{self.cfg.name}] 受控回退只允许朝限位内侧方向"
+                f"（此处应给{'负' if side > 0 else '正'}速度），拒绝朝外指令"
+            )
+
+        cap = self.recover_vel_cap
+        v = min(abs(vel), cap)  # 低速上限硬钳制：请求再大也不超过 cap
+        self.set_following_stream(False)  # 回退是轴自身点动，先脱离任何目标流
+        self._recovering = True
+        self._recover_side = side
+        # 指令位置钳回限位边界：清除锁存时刻指令端可能越界的残量，
+        # 使恢复期间闭环不会被残余指令误差拉向限位外
+        if side > 0:
+            self._cmd_pos = min(self._cmd_pos, self.cfg.soft_limit_max)
+            self._recover_cmd_bound = self.cfg.soft_limit_max
+        else:
+            self._cmd_pos = max(self._cmd_pos, self.cfg.soft_limit_min)
+            self._recover_cmd_bound = self.cfg.soft_limit_min
+        self._mode = MotionMode.JOG
+        self._jog_vel = -side * v
+        self._profile_vel = v
+        print(
+            f"[{self.cfg.name}] 软限位受控回退：以 {v:.2f}mm/s "
+            f"（上限 {cap:.2f}）朝限位内侧点动"
+        )
+        return self
+
     def set_stream_target(self, target: float, vel: float | None = None) -> None:
         """
         刷新外部目标流的最新目标点（龙门从轴 / 电子凸轮从轴每个控制周期调用）。
@@ -325,10 +459,12 @@ class VirtualAxis:
         self._steps += 1
 
         # ---------- 1. 运动规划器 ----------
-        if self._enabled and not self.has_alarm:
+        if self._enabled and (not self.has_alarm or self._recovering):
             self._plan_step(T)
         else:
-            # 未使能或报警：指令冻结，模拟驱动器封锁脉冲
+            # 未使能或报警（非受控回退）：指令冻结，模拟驱动器封锁脉冲。
+            # 受控回退（软限位恢复）是唯一例外：报警态下仅放行朝限位
+            # 内侧的低速点动，见 jog_recover()。
             self._cmd_vel = 0.0
             self._cmd_acc = 0.0
 
@@ -345,11 +481,11 @@ class VirtualAxis:
                 self._latch_alarm(AlarmCode.FOLLOWING_ERROR, "跟随误差超过设定阈值")
 
         # ---------- 3. 闭环被控对象（一阶模型）----------
-        if not self._enabled or self.has_alarm:
-            # 未使能或报警锁存：驱动器封锁输出（模拟下电/抱闸），被控对象
-            # 不再受力 —— 实际位置/实际速度冻结，绝不会被闭环拉向指令位置。
-            # （否则"去使能立即封锁输出"就名不符实：轴会继续"伺服"到冻结
-            #  的指令位置，软限位报警后还会表现为自动退回限位内。）
+        if (not self._enabled or self.has_alarm) and not self._recovering:
+            # 未使能或报警锁存（非受控回退）：驱动器封锁输出（模拟下电/抱闸），
+            # 被控对象不再受力 —— 实际位置/实际速度冻结，绝不会被闭环拉向
+            # 指令位置。（否则"去使能立即封锁输出"就名不符实：轴会继续
+            # "伺服"到冻结的指令位置，软限位报警后还会表现为自动退回限位内。）
             self._act_vel = 0.0
             cmd_quantized = round(self._cmd_pos * self.cfg.pulse_per_unit) / self.cfg.pulse_per_unit
             self._loop_error = cmd_quantized - self._act_pos  # 遥测：冻结后的环内偏差
@@ -368,7 +504,19 @@ class VirtualAxis:
             self._act_vel = vmax_plant
         elif self._act_vel < -vmax_plant:
             self._act_vel = -vmax_plant
+        # 受控回退的驱动器级限速：实际运动速度被硬性钳制在恢复速度上限内，
+        # 即使指令端钳位造成残余误差瞬态，也绝不会超速（低速回退安全底线）
+        if self._recovering:
+            cap = self.recover_vel_cap
+            if self._act_vel > cap:
+                self._act_vel = cap
+            elif self._act_vel < -cap:
+                self._act_vel = -cap
         self._act_pos += self._act_vel * T
+
+        # 受控回退到位检查：实际位置退回限位内侧滞回带 → 自动解除锁存
+        if self._recovering:
+            self._check_recover_release()
 
     def _plan_step(self, T: float) -> None:
         """单周期规划：根据任务模式计算本周期指令速度/位置增量"""
@@ -405,10 +553,21 @@ class VirtualAxis:
 
         self._cmd_pos += self._cmd_vel * T
 
-        # 点动模式下也要防止冲出软限位（规划层面预判）
-        nxt = self._cmd_pos + self._cmd_vel * T
-        if nxt > cfg.soft_limit_max or nxt < cfg.soft_limit_min:
-            self._cmd_vel = 0.0
+        if self._recovering:
+            # 受控回退的安全底线（包络约束）：指令位置绝不越过回退钳位点
+            # （限位边界）——恢复过程中指令只能原地或朝限位内侧移动，
+            # 任何情况（含规划器异常）下都不允许更深入限位。
+            if self._recover_side > 0 and self._cmd_pos > self._recover_cmd_bound:
+                self._cmd_pos = self._recover_cmd_bound
+                self._cmd_vel = min(self._cmd_vel, 0.0)
+            elif self._recover_side < 0 and self._cmd_pos < self._recover_cmd_bound:
+                self._cmd_pos = self._recover_cmd_bound
+                self._cmd_vel = max(self._cmd_vel, 0.0)
+        else:
+            # 点动模式下也要防止冲出软限位（规划层面预判）
+            nxt = self._cmd_pos + self._cmd_vel * T
+            if nxt > cfg.soft_limit_max or nxt < cfg.soft_limit_min:
+                self._cmd_vel = 0.0
 
     def _follow_stream(self, T: float) -> None:
         """
@@ -571,4 +730,84 @@ if __name__ == "__main__":
     print(f"  理论稳态误差 = v/Kp = {theory:.4f} mm")
     print(f"  仿真实测误差 = {ax2.following_error:.4f} mm")
     assert abs(ax2.following_error - theory) < 0.02 * theory, "跟随误差与理论不符！"
+
+    # ---- 软限位受控回退恢复回归（复审报告 05 N-P2-1：报警不可复位死锁）----
+    # 场景：点动运行中把软限位收紧到实际位置之内（模拟坐标系偏置后限位
+    # 收紧），实际位置已在限位外 → SOFT_LIMIT 锁存、输出封锁冻结。
+    print("\n[软限位受控回退验证]")
+    ax3 = VirtualAxis(
+        AxisConfig(
+            name="SL",
+            kp_pos=40.0,
+            max_vel=800.0,
+            soft_limit_min=-10.0,
+            soft_limit_max=50.0,
+            following_error_alarm=0,  # 本用例只关注软限位保护
+        ),
+        dt=dt,
+    )
+    ax3.enable()
+    ax3.jog(300.0)
+    for _ in range(int(0.15 / dt)):
+        ax3.step()
+    ax3.cfg.soft_limit_max = round(ax3.act_pos - 5.0, 3)  # 收紧到实际位置内 5mm
+    ax3.step()
+    assert ax3.alarm == AlarmCode.SOFT_LIMIT, "收紧限位后应触发 SOFT_LIMIT 锁存"
+    assert ax3.act_pos > ax3.cfg.soft_limit_max, "锁存时实际位置应在限位外"
+    frozen = ax3.act_pos
+    for _ in range(int(0.3 / dt)):
+        ax3.step()
+    assert ax3.act_pos == frozen and ax3.act_vel == 0.0, "报警锁存后实际位置必须冻结"
+    assert ax3.clear_alarm() is False, "条件未消失（仍在限位外）时禁止复位"
+    for bad_vel in (+50.0, -50.0):
+        try:
+            ax3.jog(bad_vel)
+            raise AssertionError("报警态普通 jog 应被拒绝")
+        except RuntimeError:
+            pass
+    try:
+        ax3.jog_recover(+30.0)
+        raise AssertionError("朝外（继续深入限位）的受控回退应被拒绝")
+    except ValueError:
+        pass
+
+    cap = ax3.recover_vel_cap  # 800 × 20% = 160 mm/s
+    start_pos = ax3.act_pos
+    ax3.jog_recover(-2000.0)  # 请求速度远超上限 → 实际执行必须被钳到 cap
+    rec_pos: list[float] = []
+    rec_vel: list[float] = []
+    released = False
+    for _ in range(int(2.0 / dt)):
+        ax3.step()
+        rec_pos.append(ax3.act_pos)
+        rec_vel.append(ax3.act_vel)
+        if not ax3.has_alarm:
+            released = True
+            break
+    assert released, "退回限位内后锁存应自动解除"
+    peak = max(abs(v) for v in rec_vel)
+    assert peak <= cap + 1e-6, f"回退实际速度 {peak:.2f} 必须≤硬上限 {cap:.2f}"
+    assert peak > cap * 0.95, "回退速度应确实跑到上限（钳制生效），而非从未加速"
+    assert max(rec_pos) <= start_pos + 1e-9, "回退全程不得比锁存点更深入限位"
+    assert ax3.act_pos < ax3.cfg.soft_limit_max, "解除时实际位置应已在限位内"
+    assert ax3.is_enabled, "锁存解除后轴应保持使能"
+
+    # 解除后恢复正常运动：点动 + 绝对定位均应可用并真实到位
+    ax3.jog(-100.0)
+    for _ in range(int(0.1 / dt)):
+        ax3.step()
+    ax3.stop()
+    ax3.move_abs(10.0, vel=200.0)
+    settled = False
+    for _ in range(int(3.0 / dt)):
+        ax3.step()
+        if not ax3.is_moving and ax3.in_position:
+            settled = True
+            break
+    assert settled and ax3.alarm == AlarmCode.NONE, "解除锁存后应恢复正常定位运动"
+    print(
+        f"  锁存于 {frozen:.3f}mm（上限 {ax3.cfg.soft_limit_max:.3f}）→ 朝外拒绝 →"
+        f" 回退峰值 {peak:.1f}mm/s = 硬上限 {cap:.1f} → 回位自动解除 → 正常定位 [OK]"
+    )
+
     print("自测试通过 [OK]")

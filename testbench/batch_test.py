@@ -13,6 +13,9 @@
    正常完成 —— 展示真实龙门"超差即停"的安全逻辑。
 3. 飞剪带速扫描：400 / 700 / 1000 / 1300 mm/s
    → 同步段速度误差 均值/最大、循环节拍（实测 vs 理论）。
+4. 软限位受控回退恢复演示：SOFT_LIMIT 锁存（输出封锁冻结）后，
+   报警态朝外指令被拒、仅可朝限位内侧低速回退（速度≤硬上限）、
+   回位自动解除锁存并恢复正常运动 —— 轴级报警恢复路径回归。
 
 输出
 ----
@@ -39,11 +42,11 @@ import numpy as np
 # 支持包运行与直接脚本运行两种方式
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from axis.virtual_axis import AlarmCode
+    from axis.virtual_axis import AlarmCode, AxisConfig, VirtualAxis
     from gantry.gantry import GantryController, GantryParams
     from cam.electronic_cam import FlyingShear, ShearParams
 else:
-    from axis.virtual_axis import AlarmCode
+    from axis.virtual_axis import AlarmCode, AxisConfig, VirtualAxis
     from gantry.gantry import GantryController, GantryParams
     from cam.electronic_cam import FlyingShear, ShearParams
 
@@ -209,6 +212,142 @@ def run_alarm_demo() -> AlarmDemo:
 
 
 # ---------------------------------------------------------------------------
+# 实验 4：软限位受控回退恢复演示（复审报告 05 N-P2-1 回归用例）
+# ---------------------------------------------------------------------------
+@dataclass
+class SoftLimitDemo:
+    """软限位受控回退恢复的逐步验证结果"""
+
+    latched: bool           # SOFT_LIMIT 是否锁存且实际位置冻结
+    clear_refused: bool     # 条件未消失（仍在限位外）时 clear_alarm 是否拒绝复位
+    outward_rejected: bool  # 报警态普通 jog 与朝外受控回退是否均被拒绝
+    speed_ok: bool          # 回退实际执行速度是否≤硬上限（请求超限时被钳制）
+    no_deeper: bool         # 回退全程是否从未比锁存点更深入限位
+    released: bool          # 退回限位内后锁存是否自动解除
+    normal_ok: bool         # 解除后是否恢复正常运动（点动+绝对定位）
+    peak_vel: float         # 回退实际峰值速度 (mm/s)
+    vel_cap: float          # 恢复速度硬上限 (mm/s)
+    detail: str             # 验证说明（供报告/自检输出）
+
+    @property
+    def ok(self) -> bool:
+        return (
+            self.latched and self.clear_refused and self.outward_rejected
+            and self.speed_ok and self.no_deeper and self.released and self.normal_ok
+        )
+
+
+def run_soft_limit_recovery_demo() -> SoftLimitDemo:
+    """
+    轴级软限位报警恢复路径回归（复审报告 05 N-P2-1）。
+
+    场景：轴朝上限点动，运行中把软限位收紧到实际位置之内（模拟坐标系
+    偏置后限位收紧）→ 实际位置已在限位外 → SOFT_LIMIT 锁存、输出封锁
+    冻结（锁存瞬间位置必然在限位外，若无恢复通道则复位条件永不满足）。
+    随后逐步验证受控回退恢复链：
+
+      ① 报警态普通 jog（无论朝向）被拒绝；clear_alarm 返回 False；
+      ② jog_recover 朝外指令直接拒绝，仅放行朝限位内侧方向；
+      ③ 回退请求速度超限时被钳制到硬上限（max_vel×25%）内执行；
+      ④ 回退全程位置单调向内，绝不比锁存点更深入限位；
+      ⑤ 退回限位内侧滞回带后锁存自动解除、保持使能，恢复正常定位。
+    """
+    ax = VirtualAxis(
+        AxisConfig(
+            name="SL-RECOVER",
+            kp_pos=40.0,
+            max_vel=800.0,
+            soft_limit_min=-10.0,
+            soft_limit_max=50.0,
+            following_error_alarm=0,  # 本用例只关注软限位保护
+        ),
+        dt=0.001,
+    )
+    ax.enable()
+    ax.jog(300.0)
+    for _ in range(150):
+        ax.step()
+    ax.cfg.soft_limit_max = round(ax.act_pos - 5.0, 3)  # 收紧到实际位置内 5mm
+    ax.step()
+    frozen_pos = ax.act_pos
+    for _ in range(500):
+        ax.step()
+    latched = (
+        ax.alarm == AlarmCode.SOFT_LIMIT
+        and frozen_pos > ax.cfg.soft_limit_max
+        and ax.act_pos == frozen_pos
+        and ax.act_vel == 0.0
+    )
+    clear_refused = ax.clear_alarm() is False
+
+    outward_rejected = True
+    try:
+        ax.jog(-100.0)  # 报警态普通 jog：无论朝向都应拒绝
+    except RuntimeError:
+        pass
+    else:
+        outward_rejected = False
+    try:
+        ax.jog_recover(+100.0)  # 朝外（继续深入限位）的回退指令：必须拒绝
+    except ValueError:
+        pass
+    else:
+        outward_rejected = False
+
+    cap = ax.recover_vel_cap
+    start_pos = ax.act_pos
+    ax.jog_recover(-2000.0)  # 请求速度远超上限 → 实际执行必须被钳到 cap
+    positions: list[float] = []
+    vels: list[float] = []
+    released = False
+    for _ in range(2000):
+        ax.step()
+        positions.append(ax.act_pos)
+        vels.append(ax.act_vel)
+        if not ax.has_alarm:
+            released = True
+            break
+    peak_vel = max((abs(v) for v in vels), default=0.0)
+    speed_ok = released and peak_vel <= cap + 1e-6 and peak_vel > cap * 0.95
+    no_deeper = max(positions, default=start_pos) <= start_pos + 1e-9
+
+    # 解除后恢复正常运动：点动 + 绝对定位真实到位
+    normal_ok = False
+    try:
+        ax.jog(-100.0)
+        for _ in range(100):
+            ax.step()
+        ax.stop()
+        ax.move_abs(10.0, vel=200.0)
+        for _ in range(3000):
+            ax.step()
+            if not ax.is_moving and ax.in_position:
+                normal_ok = ax.alarm == AlarmCode.NONE
+                break
+    except RuntimeError:
+        normal_ok = False
+
+    detail = (
+        f"锁存于 {frozen_pos:.3f}mm（上限 {ax.cfg.soft_limit_max:.3f}mm，位置冻结），"
+        f"clear_alarm 拒绝={clear_refused}，朝外拒绝={outward_rejected}，"
+        f"回退峰值 {peak_vel:.1f}mm/s ≤ 硬上限 {cap:.1f}mm/s，"
+        f"回位自动解除={released}，恢复正常定位={normal_ok}"
+    )
+    return SoftLimitDemo(
+        latched=latched,
+        clear_refused=clear_refused,
+        outward_rejected=outward_rejected,
+        speed_ok=speed_ok,
+        no_deeper=no_deeper,
+        released=released,
+        normal_ok=normal_ok,
+        peak_vel=peak_vel,
+        vel_cap=cap,
+        detail=detail,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 实验 3：飞剪带速扫描
 # ---------------------------------------------------------------------------
 @dataclass
@@ -261,6 +400,7 @@ def run_self_checks(
     cells: list[MatrixCell],
     alarm_demo: AlarmDemo,
     shear_rows: list[ShearRow],
+    soft_limit_demo: SoftLimitDemo | None = None,
 ) -> list[tuple[str, bool, str]]:
     """
     对实验结果做实时一致性校验，返回 (名称, 是否通过, 数据说明) 列表。
@@ -332,6 +472,15 @@ def run_self_checks(
         ok_dev,
         f"各带速最大偏差 {dev_max:.2f} ms",
     ))
+
+    # ⑤ 软限位受控回退恢复：报警态朝外拒绝 + 回退速度≤硬上限 + 回位自动解除
+    # （复审报告 05 N-P2-1：冻结语义下 SOFT_LIMIT 曾无任何轴级恢复路径）
+    if soft_limit_demo is not None:
+        checks.append((
+            "软限位受控回退恢复(朝外拒绝+速度≤上限+回位自动解除)",
+            soft_limit_demo.ok,
+            soft_limit_demo.detail,
+        ))
 
     return checks
 
@@ -473,7 +622,7 @@ def build_report_md(
 def main() -> None:
     """运行全部实验并输出报告与原始数据"""
     print("=" * 72)
-    print("开始批量测试：龙门矩阵 + 报警演示 + 飞剪带速扫描")
+    print("开始批量测试：龙门矩阵 + 报警演示 + 飞剪带速扫描 + 软限位恢复")
     print("=" * 72)
 
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -483,9 +632,12 @@ def main() -> None:
     improvements = _p95_improvements(cells)
     alarm_demo = run_alarm_demo()
     shear_rows = run_shear_sweep()
+    soft_limit_demo = run_soft_limit_recovery_demo()
+    print(f"[软限位恢复] {soft_limit_demo.detail} → "
+          f"{'通过' if soft_limit_demo.ok else '未通过'}")
 
     # ---- 数据一致性自检（评审整改项）：结论必须能被数据支撑 ----
-    checks = run_self_checks(cells, alarm_demo, shear_rows)
+    checks = run_self_checks(cells, alarm_demo, shear_rows, soft_limit_demo)
 
     # ---- 写 CSV 原始数据 ----
     matrix_csv = DATA_DIR / "gantry_matrix.csv"

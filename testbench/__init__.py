@@ -7,6 +7,7 @@ testbench 包：参数扫描批量测试与测试报告生成。
     run_gantry_matrix   -- 龙门矩阵实验：补偿开/关 × 增益失配 5%~30%
     run_shear_sweep     -- 飞剪带速扫描实验
     run_alarm_demo      -- 同步偏差报警联锁演示
+    run_soft_limit_recovery_demo -- 软限位受控回退恢复演示
 
 说明：这里使用惰性导入（模块级 __getattr__），既支持 `from testbench import ...`
 的正常用法，也保证 `python -m testbench.batch_test` 直接运行时不会产生重复导入警告。
@@ -30,7 +31,17 @@ def __getattr__(name: str):
         from .batch_test import run_alarm_demo
 
         return run_alarm_demo
+    if name == "run_soft_limit_recovery_demo":
+        from .batch_test import run_soft_limit_recovery_demo
+
+        return run_soft_limit_recovery_demo
     raise AttributeError(f"testbench 模块没有属性 {name!r}")
 
 
-__all__ = ["main", "run_gantry_matrix", "run_shear_sweep", "run_alarm_demo"]
+__all__ = [
+    "main",
+    "run_gantry_matrix",
+    "run_shear_sweep",
+    "run_alarm_demo",
+    "run_soft_limit_recovery_demo",
+]
