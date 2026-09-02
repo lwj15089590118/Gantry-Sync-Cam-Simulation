@@ -34,6 +34,8 @@
            cursor: pointer; transition: background .15s; }
   button:hover { background: #1d4ed8; }
   button:disabled { background: #94a3b8; cursor: wait; }
+  button.btn-danger { background: #dc2626; }
+  button.btn-danger:hover { background: #b91c1c; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
   .chip { background: #eef2ff; color: #3730a3; border-radius: 6px;
           font-size: 12px; padding: 4px 8px; }
@@ -67,11 +69,14 @@
     <div class="panel">
       <h2>① 龙门双轴同步实验</h2>
       <label>两轴增益失配度：<span id="misVal">20</span> %（Kp2 = Kp1×(1−失配)）</label>
-      <input type="range" id="mismatch" min="5" max="50" step="1" value="20">
+      <input type="range" id="mismatch" min="5" max="90" step="1" value="20">
       <div class="row">
         <input type="checkbox" id="compOn" checked> 开启交叉耦合同步补偿
       </div>
+      <label>同步偏差报警阈值 mm（|Δ| 超限 → 联锁停机）</label>
+      <input type="number" id="syncThresh" value="10" step="0.5" min="0.5" max="20">
       <button id="btnGantry">运行龙门定位实验</button>
+      <button id="btnInterlock" class="btn-danger">⚠ 一键联锁演示：失配拉满 90% · 无补偿 · 默认阈值</button>
       <div class="chips" id="gantryChips"></div>
       <div class="msg" id="gantryMsg"></div>
     </div>
@@ -215,43 +220,81 @@ function initCharts(){
 /* =========================================================
  * 龙门实验
  * ========================================================= */
+/* 报警停机竖线：返回 t 序列中最接近触发时刻的样本下标（类目轴用下标定位） */
+function alarmMarkIdx(t, alarmTime){
+  let idx = 0, best = Infinity;
+  for (let i = 0; i < t.length; i++){
+    const d = Math.abs(t[i] - alarmTime);
+    if (d < best){ best = d; idx = i; }
+  }
+  return idx;
+}
+
 async function runGantry(){
   $("gantryMsg").textContent = "";
-  const btn = $("btnGantry"); btn.disabled = true;
+  const btn = $("btnGantry"), btnDemo = $("btnInterlock");
+  btn.disabled = true; btnDemo.disabled = true;
   try{
     const data = await postJSON("/api/gantry", {
       mismatch_pct: parseFloat($("mismatch").value),
-      comp: $("compOn").checked
+      comp: $("compOn").checked,
+      threshold_mm: parseFloat($("syncThresh").value)
     });
     const t = data.t;
+    /* 联锁触发时刻竖线（位置图与 Δ 图都标注停机点） */
+    const alarmLine = (data.alarm_sync && data.alarm_time_s != null)
+      ? [{xAxis: alarmMarkIdx(t, data.alarm_time_s),
+          label:{formatter:"报警停机 t=" + data.alarm_time_s + "s",
+                 position:"insideEndTop", fontSize:11}}]
+      : [];
     gantryChart.setOption({
       xAxis:{data:t},
       series:[
-        {data:data.master_cmd},
+        {data:data.master_cmd,
+         markLine:{symbol:"none", silent:true,
+           lineStyle:{color:"#dc2626", type:"dashed", width:1.5},
+           data:alarmLine}},
         {data:data.act1},
         {data:data.act2}
       ]
     });
+    const mkData = [
+      {yAxis:data.sync_threshold_mm, label:{formatter:"报警阈值 +{c}mm"}},
+      {yAxis:-data.sync_threshold_mm, label:{formatter:"−{c}mm"}}
+    ].concat(alarmLine);
     syncChart.setOption({
       xAxis:{data:t},
       series:[{data:data.sync_err_mm,
         markLine:{symbol:"none", silent:true,
           lineStyle:{color:"#dc2626", type:"dashed"},
-          data:[{yAxis:data.sync_threshold_mm, label:{formatter:"报警阈值 +{c}mm"}},
-                {yAxis:-data.sync_threshold_mm, label:{formatter:"−{c}mm"}}]}
+          data:mkData}
       }]
     });
     const p = data.params_used, st = data.stats;
-    renderChips($("gantryChips"), [
+    const chips = [
       {text:"失配 " + p.mismatch_pct + "%（Kp1="+p.kp1+" / Kp2="+p.kp2+"）"},
+      {text:"阈值 " + p.sync_threshold_mm + " mm"},
       {text:p.comp ? "补偿：开" : "补偿：关", warn:!p.comp},
       {text:"均值 " + st.mean_um + " µm"},
       {text:"P95 " + st.p95_um + " µm"},
       {text:"最大 " + st.max_um + " µm"}
-    ].concat(data.alarm_sync ? [{text:"⚠ 触发同步报警停机", warn:true}] : []));
+    ];
+    /* 联锁停机证据：触发时刻 / 峰值Δ / 停机耗时 / 停机位置（stop_metrics） */
+    if (data.alarm_sync && data.stop_metrics){
+      const sm = data.stop_metrics;
+      chips.push(
+        {text:"⚠ 触发同步报警停机", warn:true},
+        {text:"触发 t=" + sm.alarm_time_s + "s", warn:true},
+        {text:"峰值 Δ " + sm.peak_sync_err_mm + " mm", warn:true},
+        {text:"停机耗时 " + (sm.stop_within_resolution
+            ? "≤" + sm.dt_record_ms + "ms" : sm.stop_ms + "ms"), warn:true},
+        {text:"停于 X1=" + sm.act1_stop_mm + " / X2=" + sm.act2_stop_mm + " mm", warn:true}
+      );
+    }
+    renderChips($("gantryChips"), chips);
   }catch(err){
     $("gantryMsg").textContent = err.message;
-  }finally{ btn.disabled = false; }
+  }finally{ btn.disabled = false; btnDemo.disabled = false; }
 }
 
 /* =========================================================
@@ -468,6 +511,15 @@ $("beltSpeed").addEventListener("input", function(){
   $("beltVal").textContent = this.value;
 });
 $("btnGantry").addEventListener("click", runGantry);
+/* 一键联锁演示：看板参数上限组合（失配 90% / 无补偿 / 默认阈值 10mm），
+ * 与 testbench"看板参数上限联锁可达"断言同一参数组合（复审报告 05 N-P3-2） */
+$("btnInterlock").addEventListener("click", async function(){
+  $("mismatch").value = 90;
+  $("misVal").textContent = "90";
+  $("compOn").checked = false;
+  $("syncThresh").value = 10;
+  await runGantry();
+});
 $("btnCam").addEventListener("click", loadCam);
 $("btnShear").addEventListener("click", runShear);
 

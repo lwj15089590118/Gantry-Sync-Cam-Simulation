@@ -128,8 +128,46 @@ class GantryResult:
             "samples": int(len(data)),
         }
 
+    def stop_metrics(self) -> dict | None:
+        """
+        同步报警联锁停机过程的可验证数据（复审报告 05 N-P3-2：此前
+        alarm_time/vel 序列仅服务 testbench 内部，看板与外部拿不到联锁证据）。
+
+        报警触发时返回：
+          alarm_time_s        触发时刻 (s)
+          stop_ms             触发 → 双轴速度归零的耗时（与 testbench
+                              _verify_interlock 同口径）
+          stop_within_resolution  True=首个报警后记录样本速度已为 0
+                              （停机耗时小于记录分辨率）
+          dt_record_ms        记录分辨率 (ms)
+          peak_sync_err_mm    停机前 |Δ| 峰值（锁存冻结值）
+          act1/act2_stop_mm   双轴停机位置（未走完全程）
+        未报警返回 None。记录分辨率为 record_every×dt（默认 5ms）。
+        """
+        if not (self.alarm_sync and self.alarm_time_s is not None) or len(self.t) < 2:
+            return None
+        idx = np.nonzero(self.t >= self.alarm_time_s)[0]
+        if len(idx) == 0:
+            return None
+        dt_rec = float(np.median(np.diff(self.t)))
+        stop_ms = 0.0
+        if self.vel1 is not None and self.vel2 is not None and len(idx) >= 2:
+            v_peak = np.maximum(np.abs(self.vel1[idx]), np.abs(self.vel2[idx]))
+            moving = v_peak > 1e-6
+            if moving.any():
+                stop_ms = float((self.t[idx[moving][-1]] - self.alarm_time_s) * 1000.0)
+        return {
+            "alarm_time_s": round(self.alarm_time_s, 4),
+            "stop_ms": round(stop_ms, 1),
+            "stop_within_resolution": stop_ms == 0.0,
+            "dt_record_ms": round(dt_rec * 1000.0, 1),
+            "peak_sync_err_mm": round(float(np.max(np.abs(self.sync_err))), 3),
+            "act1_stop_mm": round(float(self.act1[idx[0]]), 3),
+            "act2_stop_mm": round(float(self.act2[idx[0]]), 3),
+        }
+
     def to_plot_series(self, max_points: int = 600) -> dict:
-        """降采样为适合 Web 图表绘制的数据系列"""
+        """降采样为适合 Web 图表绘制的数据系列（含联锁停机证据字段）"""
         idx = downsample_slice(len(self.t), max_points)
         return {
             "t": [round(v, 4) for v in self.t[idx]],
@@ -137,9 +175,16 @@ class GantryResult:
             "act1": [round(v, 4) for v in self.act1[idx]],
             "act2": [round(v, 4) for v in self.act2[idx]],
             "sync_err_mm": [round(v, 5) for v in self.sync_err[idx]],
+            # 停机过程速度序列（报警后归零并冻结，供看板/外部验证联锁）
+            "vel1": [round(v, 2) for v in self.vel1[idx]] if self.vel1 is not None else [],
+            "vel2": [round(v, 2) for v in self.vel2[idx]] if self.vel2 is not None else [],
             "sync_threshold_mm": self.params.sync_threshold_mm,
             "stats": {k: round(v, 2) for k, v in self.stats().items()},
             "alarm_sync": self.alarm_sync,
+            "alarm_time_s": (
+                round(self.alarm_time_s, 4) if self.alarm_time_s is not None else None
+            ),
+            "stop_metrics": self.stop_metrics(),
         }
 
 

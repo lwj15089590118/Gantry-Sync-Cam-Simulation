@@ -52,17 +52,28 @@ def index():
 def api_gantry():
     """
     请求体 JSON：
-      mismatch_pct : 两轴增益失配度百分比（5~50）
+      mismatch_pct : 两轴增益失配度百分比（5~90）
       comp         : 是否开启交叉耦合同步补偿
-    返回：降采样后的时间序列 + 统计指标
+      threshold_mm : 同步偏差报警阈值 mm（0.5~20，缺省 10=GantryParams 默认）
+    返回：降采样时间序列 + 统计指标 + 联锁停机证据（alarm_time_s 触发时刻、
+    vel1/vel2 停机速度序列、stop_metrics 峰值Δ/停机耗时/停机位置）
     """
     try:
         data = request.get_json(force=True)
         mismatch = float(data.get("mismatch_pct", 20)) / 100.0
         comp = bool(data.get("comp", True))
-        mismatch = min(max(mismatch, 0.01), 0.60)  # 夹取到合理区间
+        threshold = float(data.get("threshold_mm", GantryParams().sync_threshold_mm))
+        # 失配夹取上限放宽 60% → 90%（复审报告 05 N-P3-2）：原 60% 上限稳态
+        # Δ=v(1/Kp2−1/Kp1)≈7.5mm < 默认阈值 10mm，看板永远触发不了同步联锁；
+        # 90% 时 Δ≈45mm，无补偿 t≈0.13s 即触发 SYNC_EXCEED。上限取 90% 而非
+        # 更高，是因为 95% 失配下 X2 轴级跟随误差报警（50mm）会抢先触发，
+        # 干扰"同步超差联锁"的演示叙事（实测探针验证）。
+        mismatch = min(max(mismatch, 0.01), 0.90)
+        threshold = min(max(threshold, 0.5), 20.0)
 
-        prm = GantryParams(mismatch=mismatch, comp_enabled=comp)
+        prm = GantryParams(
+            mismatch=mismatch, comp_enabled=comp, sync_threshold_mm=threshold
+        )
         result = GantryController(prm).run_positioning()
         payload = result.to_plot_series()
         payload["params_used"] = {
@@ -70,6 +81,7 @@ def api_gantry():
             "comp": comp,
             "kp1": prm.kp_base,
             "kp2": round(prm.kp_base * (1 - mismatch), 2),
+            "sync_threshold_mm": prm.sync_threshold_mm,
         }
         return jsonify(payload)
     except Exception as exc:  # noqa: BLE001 - 看板接口统一兜底

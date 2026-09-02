@@ -16,6 +16,10 @@
 4. 软限位受控回退恢复演示：SOFT_LIMIT 锁存（输出封锁冻结）后，
    报警态朝外指令被拒、仅可朝限位内侧低速回退（速度≤硬上限）、
    回位自动解除锁存并恢复正常运动 —— 轴级报警恢复路径回归。
+5. 看板参数上限联锁可达演示：失配 90%（看板滑动条/接口夹取上限）、
+   补偿关、默认阈值 10mm 即触发同步联锁并验证动作链 —— 复审报告
+   05 N-P3-2：原 60% 上限稳态 Δ≈7.5mm < 10mm，web 端永远无法
+   演示"超差即停"。
 
 输出
 ----
@@ -348,6 +352,36 @@ def run_soft_limit_recovery_demo() -> SoftLimitDemo:
 
 
 # ---------------------------------------------------------------------------
+# 实验 5：看板参数上限联锁可达演示（第四轮修补：复审报告 05 N-P3-2）
+# ---------------------------------------------------------------------------
+def run_dashboard_interlock_demo() -> tuple[bool, str]:
+    """
+    验证放宽后的看板演示参数上限可以在 web 端现场复现同步联锁。
+
+    参数组合（与看板"一键联锁演示"按钮/滑动条上限完全一致）：
+      失配 90%（dashboard 接口夹取上限）+ 补偿关 + 默认阈值 10mm
+      （GantryParams.sync_threshold_mm 默认值），行程 300mm / 300mm/s。
+    此前看板夹取上限 60% 时稳态 Δ=v(1/Kp2−1/Kp1)≈7.5mm < 10mm，
+    SYNC_EXCEED 永远触发不了，主打的安全联锁叙事无法在 web 端演示。
+    触发后复用 _verify_interlock 校验联锁动作链真实性，并以
+    GantryResult.stop_metrics（看板同源字段）给出触发时刻/峰值Δ/停机耗时。
+    """
+    prm = GantryParams(mismatch=0.90, comp_enabled=False)  # 阈值保持默认 10mm
+    ctl = GantryController(prm)
+    res = ctl.run_positioning()
+    if not (res.alarm_sync and res.alarm_time_s is not None):
+        return False, (
+            "看板参数上限（失配90%/补偿关/阈值10mm）未触发同步联锁，web 端演示不可达"
+        )
+    sm = res.stop_metrics()
+    ok, _stop_ms, detail = _verify_interlock(ctl, res)
+    return ok, (
+        f"参数组合：失配90%(看板上限)/补偿关/阈值10mm(默认) → "
+        f"t={res.alarm_time_s:.3f}s 触发，峰值Δ={sm['peak_sync_err_mm']}mm，{detail}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 实验 3：飞剪带速扫描
 # ---------------------------------------------------------------------------
 @dataclass
@@ -401,6 +435,7 @@ def run_self_checks(
     alarm_demo: AlarmDemo,
     shear_rows: list[ShearRow],
     soft_limit_demo: SoftLimitDemo | None = None,
+    dash_interlock: tuple[bool, str] | None = None,
 ) -> list[tuple[str, bool, str]]:
     """
     对实验结果做实时一致性校验，返回 (名称, 是否通过, 数据说明) 列表。
@@ -480,6 +515,15 @@ def run_self_checks(
             "软限位受控回退恢复(朝外拒绝+速度≤上限+回位自动解除)",
             soft_limit_demo.ok,
             soft_limit_demo.detail,
+        ))
+
+    # ⑥ 看板参数上限联锁可达：放宽失配上限后 web 端可现场复现联锁
+    # （复审报告 05 N-P3-2：原 60% 上限 Δ≈7.5mm < 默认阈值 10mm，永远触发不了）
+    if dash_interlock is not None:
+        checks.append((
+            "看板参数上限联锁可达(失配90%/无补偿/阈值10mm)",
+            dash_interlock[0],
+            dash_interlock[1],
         ))
 
     return checks
@@ -622,7 +666,7 @@ def build_report_md(
 def main() -> None:
     """运行全部实验并输出报告与原始数据"""
     print("=" * 72)
-    print("开始批量测试：龙门矩阵 + 报警演示 + 飞剪带速扫描 + 软限位恢复")
+    print("开始批量测试：龙门矩阵 + 报警演示 + 飞剪带速扫描 + 软限位恢复 + 看板联锁可达")
     print("=" * 72)
 
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -635,9 +679,13 @@ def main() -> None:
     soft_limit_demo = run_soft_limit_recovery_demo()
     print(f"[软限位恢复] {soft_limit_demo.detail} → "
           f"{'通过' if soft_limit_demo.ok else '未通过'}")
+    dash_interlock = run_dashboard_interlock_demo()
+    print(f"[看板联锁可达] {dash_interlock[1]} → "
+          f"{'通过' if dash_interlock[0] else '未通过'}")
 
     # ---- 数据一致性自检（评审整改项）：结论必须能被数据支撑 ----
-    checks = run_self_checks(cells, alarm_demo, shear_rows, soft_limit_demo)
+    checks = run_self_checks(cells, alarm_demo, shear_rows, soft_limit_demo,
+                             dash_interlock)
 
     # ---- 写 CSV 原始数据 ----
     matrix_csv = DATA_DIR / "gantry_matrix.csv"
