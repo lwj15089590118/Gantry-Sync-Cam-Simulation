@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check (compileall)
+        run: python -m compileall -q axis gantry cam testbench dashboard
+
+      - name: Axis module self-test (S 曲线定位 + 跟随误差 = v/Kp)
+        run: python axis/virtual_axis.py
+
+      - name: Gantry module self-test (补偿开/关对比 + 联锁回归)
+        run: python gantry/gantry.py
+
+      - name: Cam module self-test (凸轮表斜率 + 飞剪 + 换产回归)
+        run: python cam/electronic_cam.py
+
+      - name: Batch testbench (矩阵/联锁/飞剪扫描 + 8 项数据一致性自检，全过 exit 0)
+        run: python -m testbench.batch_test

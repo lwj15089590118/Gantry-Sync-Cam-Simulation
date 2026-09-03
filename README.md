@@ -1,5 +1,9 @@
 # 龙门双轴同步 与 电子凸轮·飞剪 —— 虚拟轴仿真（求职作品集项目）
 
+[![CI](https://github.com/lwj15089590118/Gantry-Sync-Cam-Simulation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lwj15089590118/Gantry-Sync-Cam-Simulation/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+
 用 **Python 3.12 + numpy + flask**（全部免费开源）从零实现的运动控制系统仿真：
 
 - **虚拟伺服轴库**：脉冲当量、梯形/S 曲线规划、位置环增益产生跟随误差、
@@ -54,6 +58,20 @@ python cam/electronic_cam.py   # 凸轮表斜率 + 飞剪运行 + 换产演示
 > 以上数值由 `python -m testbench.batch_test` 在本仓库代码上生成，
 > 可一键复现；原始数据见 `docs/data/*.csv`。
 
+## 实验曲线（真实仿真输出）
+
+| 同步偏差与联锁停机 | 电子凸轮表（换产两档定长） |
+| --- | --- |
+| ![同步偏差曲线](docs/img/sync_error_curve.png) | ![凸轮表曲线](docs/img/cam_table_curve.png) |
+
+- 左图（同步）：补偿开/关 Δ(t) 由 `gantry/gantry.py` 内核真实运行绘制（失配 30%、300mm 定位），
+  P95 2143µm→429µm 与指标表一致；联锁子图为阈值 2mm 触发停机的实测速度序列（t=0.177s 触发，
+  双轴停于 26.5/24.5mm，速度归零 ≤5ms、位置零漂移）。
+- 右图（凸轮）：`cam/electronic_cam.py` 的 `build_flying_shear_table` 生成的 256 点表，
+  同步段斜率=定长 L，落刀相位 θ_cut 随换产新表重算（0.3000→0.2667）。
+- 以上曲线均为本项目仿真内核的一次性真实运行数据（matplotlib 渲染），与
+  `python -m testbench.batch_test` 输出同源，可用 `docs/data/*.csv` 交叉核对。
+
 ## 目录结构
 
 ```text
@@ -89,6 +107,48 @@ python cam/electronic_cam.py   # 凸轮表斜率 + 飞剪运行 + 换产演示
 | Canvas 动画 | 输送带滚动 + 产品等距移动 + 切刀按凸轮轨迹联动、落刀红闪、同步区绿条 |
 | 报告内嵌 | 直接展示 docs/测试报告.md 全文 |
 
+## FAQ（复审/面试高频问答）
+
+**Q1：同步报警触发后，轴会怎样？会自己恢复吗？**
+不会自己恢复。联锁动作链为：主轴斜坡停（滑行约 128ms 归零）→ 双从轴脱离目标流并
+`disable()` 封锁输出（速度归零 ≤5ms、实际位置冻结零漂移）→ 控制器级 `SYNC_EXCEED`
+报警锁存、进入 FAULTED——条件消失也不能自动复位，必须 `reset()` 复位后重走。
+该行为由 batch_test 自检③b 自动断言（复审报告 05 P1-1 修复项）。
+
+**Q2：SOFT_LIMIT 软限位报警怎么恢复？**
+真实伺服的"受控回退"惯例：报警态输出封锁冻结、朝外指令一律拒绝，仅保留
+`jog_recover()` 唯一通道——朝限位**内侧**低速点动（默认限速 20% max_vel，
+可配 5%~25%，25% 为硬编码钳制上限），退回限位内越过 0.05mm 滞回带后锁存
+自动解除、恢复正常定位（batch_test 自检⑤）。
+
+**Q3：换产（改定长）后落刀相位怎么办？**
+换表在周期边界生效并"重新定相"消除虚计落刀，同时用**新表** `seg_info` 重算
+落刀相位 `theta_cut` 与统计内窗（600→900mm 时 θ_cut 0.3000→0.2667）。
+回归断言：换产后首刀实测与按新表相位推算差 0.1ms（复审报告 05 P2-1 修复项）。
+
+**Q4：电子凸轮表是怎么生成的？**
+`build_flying_shear_table` 按飞剪工艺分段（待机→加速追赶→同步切刀→减速脱离→
+快速返回）：在 8192 点细网格上构造速度形状函数 w(θ) 再积分成位移；**同步段斜率
+恒等于定长 L**（刀带同速的核心设计规则），返回段峰值斜率由"周期位移净面积为零"
+约束自动解出，最后采样成 256 点工程凸轮表（首尾闭合、支持周期回绕插值）。
+
+**Q5：为什么交叉耦合补偿恰好收益 80%？**
+两从轴跟随误差 e≈v/Kp，失配使 Δ=v/Kp2−v/Kp1；交叉耦合把偏差以 Kcc=2 对称反馈
+回两轴目标，稳态 Δ 压缩为 1/(1+2Kcc)=1/5，即 P95 下降 80.0%——与四档失配实测
+79.9%~80.0% 吻合，batch_test 自检① 按理论公式实时校验。
+
+**Q6：实验结果可以复现吗？**
+可以。`python -m testbench.batch_test` 约 1 秒跑完全部实验，报告结论由本次数据
+实时计算（非写死），8 项数据一致性自检任一不过即非零码退出；CI（`.github/workflows/ci.yml`）
+在每次 push 时执行 compileall + 三模块自测试 + batch_test 全量。
+
+## Roadmap（真实规划，对应复审报告 05 残留 P3）
+
+- [ ] ECharts 本地化到 `dashboard/static/`，消除 jsdelivr/unpkg CDN 依赖，支持完全离线演示（P3-10 残留）；
+- [ ] 轴库预留 API 清理与标注（`wait_done` 忙等/`move_rel`/`*_pulses` 等）、到位窗口魔法数 20 参数化、`step(dt)`/`self.dt` 双通道收敛（P3-1/3/5 残留）；
+- [ ] 实验矩阵扩充：负载失配 `load2_extra`、速度前馈 `vel_ff`（0/0.85/1）、梯形 vs S 曲线对比各做一组扫描，让闲置配置项变成有数据支撑的结论；
+- [ ] 轻量 pytest 行为断言层，把联锁/换表/软限位等控制行为固化进 CI。
+
 ## 已知边界（诚实说明）
 
 - 只建模位置环（一阶等效），未含电流/速度环细节、间隙与柔性；
@@ -97,4 +157,4 @@ python cam/electronic_cam.py   # 凸轮表斜率 + 飞剪运行 + 换产演示
 
 ## 许可证
 
-仅供学习与求职作品集展示使用。
+[MIT License](LICENSE)（版权人 lwj15089590118）。仅供学习与求职作品集展示使用。
