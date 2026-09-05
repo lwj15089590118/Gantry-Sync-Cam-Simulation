@@ -63,7 +63,7 @@ def api_gantry():
         mismatch = float(data.get("mismatch_pct", 20)) / 100.0
         comp = bool(data.get("comp", True))
         threshold = float(data.get("threshold_mm", GantryParams().sync_threshold_mm))
-        # 失配夹取上限放宽 60% → 90%（复审报告 05 N-P3-2）：原 60% 上限稳态
+        # 失配夹取上限放宽 60% → 90%：原 60% 上限稳态
         # Δ=v(1/Kp2−1/Kp1)≈7.5mm < 默认阈值 10mm，看板永远触发不了同步联锁；
         # 90% 时 Δ≈45mm，无补偿 t≈0.13s 即触发 SYNC_EXCEED。上限取 90% 而非
         # 更高，是因为 95% 失配下 X2 轴级跟随误差报警（50mm）会抢先触发，

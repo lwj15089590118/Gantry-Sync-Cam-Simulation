@@ -130,8 +130,8 @@ class GantryResult:
 
     def stop_metrics(self) -> dict | None:
         """
-        同步报警联锁停机过程的可验证数据（复审报告 05 N-P3-2：此前
-        alarm_time/vel 序列仅服务 testbench 内部，看板与外部拿不到联锁证据）。
+        同步报警联锁停机过程的可验证数据（此前 alarm_time/vel 序列仅服务
+        testbench 内部，看板与外部拿不到联锁证据）。
 
         报警触发时返回：
           alarm_time_s        触发时刻 (s)
